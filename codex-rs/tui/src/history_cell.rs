@@ -168,7 +168,11 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
 
 impl Renderable for Box<dyn HistoryCell> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let lines = self.display_lines(area.width);
+        let lines = self
+            .as_any()
+            .downcast_ref::<ViewImageToolCallCell>()
+            .map(ViewImageToolCallCell::display_lines_with_inline_preview_once)
+            .unwrap_or_else(|| self.display_lines(area.width));
         let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
         let y = if area.height == 0 {
             0
@@ -2196,6 +2200,16 @@ pub(crate) struct ViewImageToolCallCell {
 
 impl HistoryCell for ViewImageToolCallCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        self.lines.clone()
+    }
+
+    fn transcript_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        self.transcript_lines.clone()
+    }
+}
+
+impl ViewImageToolCallCell {
+    pub(crate) fn display_lines_with_inline_preview_once(&self) -> Vec<Line<'static>> {
         let mut lines = self.lines.clone();
         if let Some(inline_preview_escape) = &self.inline_preview_escape
             && !self.inline_preview_emitted.swap(true, Ordering::SeqCst)
@@ -2206,10 +2220,6 @@ impl HistoryCell for ViewImageToolCallCell {
             ]));
         }
         lines
-    }
-
-    fn transcript_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        self.transcript_lines.clone()
     }
 }
 
@@ -4078,13 +4088,13 @@ mod tests {
         let path = image_file.path().to_path_buf();
 
         let cell = new_view_image_tool_call_with_inline_preview(path, Path::new("/tmp"), true);
-        let first = render_lines(&cell.display_lines(120));
+        let first = render_lines(&cell.display_lines_with_inline_preview_once());
         assert!(
             first.iter().any(|line| line.contains("\u{1b}_G")),
             "first render should include kitty graphics escape sequence"
         );
 
-        let second = render_lines(&cell.display_lines(120));
+        let second = render_lines(&cell.display_lines_with_inline_preview_once());
         assert!(
             second.iter().all(|line| !line.contains("\u{1b}_G")),
             "subsequent renders should not re-emit kitty graphics escape sequence"
