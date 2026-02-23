@@ -2,11 +2,13 @@
 
 use crate::update_action;
 use crate::update_action::UpdateAction;
+use crate::version::CODEX_DISPLAY_VERSION;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
 use codex_core::config::Config;
 use codex_core::default_client::create_client;
+use semver::Version;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::Path;
@@ -37,7 +39,7 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
     }
 
     info.and_then(|info| {
-        if is_newer(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false) {
+        if latest_is_newer_than_current(&info.latest_version) {
             Some(info.latest_version)
         } else {
             None
@@ -127,6 +129,13 @@ fn is_newer(latest: &str, current: &str) -> Option<bool> {
     }
 }
 
+fn latest_is_newer_than_current(latest: &str) -> bool {
+    match is_newer(latest, CODEX_DISPLAY_VERSION) {
+        Some(is_newer) => is_newer,
+        None => is_newer(latest, CODEX_CLI_VERSION).unwrap_or(false),
+    }
+}
+
 fn extract_version_from_latest_tag(latest_tag_name: &str) -> anyhow::Result<String> {
     latest_tag_name
         .strip_prefix("rust-v")
@@ -169,12 +178,10 @@ pub async fn dismiss_version(config: &Config, version: &str) -> anyhow::Result<(
     Ok(())
 }
 
-fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
-    let mut iter = v.trim().split('.');
-    let maj = iter.next()?.parse::<u64>().ok()?;
-    let min = iter.next()?.parse::<u64>().ok()?;
-    let pat = iter.next()?.parse::<u64>().ok()?;
-    Some((maj, min, pat))
+fn parse_version(v: &str) -> Option<Version> {
+    let trimmed = v.trim();
+    let normalized = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    Version::parse(normalized).ok()
 }
 
 #[cfg(test)]
@@ -210,9 +217,10 @@ mod tests {
     }
 
     #[test]
-    fn prerelease_version_is_not_considered_newer() {
-        assert_eq!(is_newer("0.11.0-beta.1", "0.11.0"), None);
-        assert_eq!(is_newer("1.0.0-rc.1", "1.0.0"), None);
+    fn prerelease_semver_comparisons_work() {
+        assert_eq!(is_newer("0.104.0", "v0.105.0-alpha.13"), Some(false));
+        assert_eq!(is_newer("0.105.0", "v0.105.0-alpha.13"), Some(true));
+        assert_eq!(is_newer("v1.0.0-alpha.2", "1.0.0-alpha.1"), Some(true));
     }
 
     #[test]
@@ -225,7 +233,13 @@ mod tests {
 
     #[test]
     fn whitespace_is_ignored() {
-        assert_eq!(parse_version(" 1.2.3 \n"), Some((1, 2, 3)));
+        assert_eq!(parse_version(" 1.2.3 \n"), Some(Version::new(1, 2, 3)));
         assert_eq!(is_newer(" 1.2.3 ", "1.2.2"), Some(true));
+    }
+
+    #[test]
+    fn malformed_versions_return_none() {
+        assert_eq!(is_newer("not-a-version", "1.2.3"), None);
+        assert_eq!(is_newer("1.2", "1.1.9"), None);
     }
 }
