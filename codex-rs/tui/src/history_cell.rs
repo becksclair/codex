@@ -70,9 +70,12 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::any::Any;
 use std::collections::HashMap;
+use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::error;
@@ -2178,15 +2181,108 @@ pub(crate) fn new_patch_apply_failure(stderr: String) -> PlainHistoryCell {
     PlainHistoryCell { lines }
 }
 
-pub(crate) fn new_view_image_tool_call(path: PathBuf, cwd: &Path) -> PlainHistoryCell {
+const VIEW_IMAGE_INLINE_MAX_BYTES: u64 = 15 * 1024 * 1024;
+const VIEW_IMAGE_INLINE_MAX_PIXELS: u64 = 4_096 * 4_096;
+const VIEW_IMAGE_INLINE_COLS: u16 = 40;
+const VIEW_IMAGE_INLINE_ROWS: u16 = 12;
+
+#[derive(Debug)]
+pub(crate) struct ViewImageToolCallCell {
+    lines: Vec<Line<'static>>,
+    transcript_lines: Vec<Line<'static>>,
+    inline_preview_escape: Option<String>,
+    inline_preview_emitted: AtomicBool,
+}
+
+impl HistoryCell for ViewImageToolCallCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        let mut lines = self.lines.clone();
+        if let Some(inline_preview_escape) = &self.inline_preview_escape
+            && !self.inline_preview_emitted.swap(true, Ordering::SeqCst)
+        {
+            lines.push(Line::from(vec![
+                Span::raw(inline_preview_escape.clone()),
+                " ".into(),
+            ]));
+        }
+        lines
+    }
+
+    fn transcript_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        self.transcript_lines.clone()
+    }
+}
+
+pub(crate) fn new_view_image_tool_call_with_inline_preview(
+    path: PathBuf,
+    cwd: &Path,
+    supports_inline_preview: bool,
+) -> ViewImageToolCallCell {
     let display_path = display_path_for(&path, cwd);
 
-    let lines: Vec<Line<'static>> = vec![
+    let mut lines: Vec<Line<'static>> = vec![
         vec!["• ".dim(), "Viewed Image".bold()].into(),
-        vec!["  └ ".dim(), display_path.dim()].into(),
+        vec!["  └ ".dim(), display_path.clone().dim()].into(),
     ];
+    let mut transcript_lines = lines.clone();
+    let mut inline_preview_escape = None;
 
-    PlainHistoryCell { lines }
+    if supports_inline_preview {
+        let preview_escape = fs::metadata(&path)
+            .map_err(|err| format!("could not read metadata: {err}"))
+            .and_then(|metadata| {
+                if metadata.len() > VIEW_IMAGE_INLINE_MAX_BYTES {
+                    Err(format!(
+                        "preview skipped: image too large (>{VIEW_IMAGE_INLINE_MAX_BYTES} bytes)"
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .and_then(|_| {
+                image::image_dimensions(&path)
+                    .map_err(|err| format!("could not read image dimensions: {err}"))
+                    .and_then(|(width, height)| {
+                        if u64::from(width) * u64::from(height) > VIEW_IMAGE_INLINE_MAX_PIXELS {
+                            Err(format!(
+                                "preview skipped: image dimensions too large ({}x{})",
+                                width, height
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    })
+            })
+            .map(|_| {
+                let payload = base64::engine::general_purpose::STANDARD
+                    .encode(path.to_string_lossy().as_bytes());
+                format!(
+                    "\u{1b}_Ga=T,t=f,c={VIEW_IMAGE_INLINE_COLS},r={VIEW_IMAGE_INLINE_ROWS};{payload}\u{1b}\\"
+                )
+            });
+        match preview_escape {
+            Ok(escape) => {
+                inline_preview_escape = Some(escape);
+                lines.push(vec!["  └ ".dim(), "inline preview rendered".dim()].into());
+                transcript_lines.push(vec!["  └ ".dim(), "inline preview rendered".dim()].into());
+            }
+            Err(reason) => {
+                lines.push(vec!["  └ ".dim(), reason.clone().dim()].into());
+                transcript_lines.push(vec!["  └ ".dim(), reason.dim()].into());
+            }
+        }
+    } else {
+        let reason = "preview unavailable: terminal does not support kitty graphics protocol";
+        lines.push(vec!["  └ ".dim(), reason.dim()].into());
+        transcript_lines.push(vec!["  └ ".dim(), reason.dim()].into());
+    }
+
+    ViewImageToolCallCell {
+        lines,
+        transcript_lines,
+        inline_preview_escape,
+        inline_preview_emitted: AtomicBool::new(false),
+    }
 }
 
 pub(crate) fn new_reasoning_summary_block(full_reasoning_buffer: String) -> Box<dyn HistoryCell> {
@@ -2404,6 +2500,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::io::Write;
 
     use codex_protocol::mcp::CallToolResult;
     use codex_protocol::mcp::Tool;
@@ -3951,6 +4048,46 @@ mod tests {
                 "⚠ Feature flag `foo`".to_string(),
                 "Use flag `bar` instead.".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn view_image_cell_transcript_omits_inline_escape_sequences() {
+        let path = PathBuf::from("/tmp/example.png");
+        let cell = new_view_image_tool_call_with_inline_preview(path, Path::new("/tmp"), true);
+
+        let transcript = render_lines(&cell.transcript_lines(120));
+        assert!(
+            transcript.iter().all(|line| !line.contains('\u{1b}')),
+            "transcript output must not include terminal escape sequences"
+        );
+    }
+
+    #[test]
+    fn view_image_cell_emits_inline_escape_once_when_supported() {
+        let image_bytes = base64::engine::general_purpose::STANDARD
+            .decode(SMALL_PNG_BASE64)
+            .expect("decode small png");
+        let mut image_file = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .expect("create temp png file");
+        image_file
+            .write_all(&image_bytes)
+            .expect("write image bytes");
+        let path = image_file.path().to_path_buf();
+
+        let cell = new_view_image_tool_call_with_inline_preview(path, Path::new("/tmp"), true);
+        let first = render_lines(&cell.display_lines(120));
+        assert!(
+            first.iter().any(|line| line.contains("\u{1b}_G")),
+            "first render should include kitty graphics escape sequence"
+        );
+
+        let second = render_lines(&cell.display_lines(120));
+        assert!(
+            second.iter().all(|line| !line.contains("\u{1b}_G")),
+            "subsequent renders should not re-emit kitty graphics escape sequence"
         );
     }
 }

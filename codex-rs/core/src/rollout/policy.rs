@@ -115,7 +115,6 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::ExecCommandEnd(_)
         | EventMsg::PatchApplyEnd(_)
         | EventMsg::McpToolCallEnd(_)
-        | EventMsg::ViewImageToolCall(_)
         | EventMsg::CollabAgentSpawnEnd(_)
         | EventMsg::CollabAgentInteractionEnd(_)
         | EventMsg::CollabWaitingEnd(_)
@@ -170,6 +169,31 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::CollabAgentInteractionBegin(_)
         | EventMsg::CollabWaitingBegin(_)
         | EventMsg::CollabCloseBegin(_)
-        | EventMsg::CollabResumeBegin(_) => None,
+        | EventMsg::CollabResumeBegin(_)
+        | EventMsg::ViewImageToolCall(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::ViewImageToolCallEvent;
+    use std::path::PathBuf;
+
+    #[test]
+    fn view_image_event_is_not_persisted_even_in_extended_mode() {
+        let event = EventMsg::ViewImageToolCall(ViewImageToolCallEvent {
+            call_id: "call-1".to_string(),
+            path: PathBuf::from("/tmp/example.png"),
+        });
+
+        assert!(!should_persist_event_msg(
+            &event,
+            EventPersistenceMode::Limited
+        ));
+        assert!(!should_persist_event_msg(
+            &event,
+            EventPersistenceMode::Extended
+        ));
     }
 }
