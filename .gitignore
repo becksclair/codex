@@ -67,6 +67,8 @@ coverage/
 
 # personal files
 personal/
+repomix-output.xml
+codex-rs/NOTES.md
 
 # os
 .DS_Store
@@ -90,4 +92,3 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
-
