@@ -90,6 +90,7 @@ use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
+use codex_protocol::protocol::AutoReviewRequest;
 use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CreditsSnapshot;
@@ -3522,6 +3523,17 @@ impl ChatWidget {
             SlashCommand::Review => {
                 self.open_review_popup();
             }
+            SlashCommand::AutoReview => {
+                self.submit_op(Op::AutoReview {
+                    request: AutoReviewRequest {
+                        target: ReviewTarget::UncommittedChanges,
+                        max_iterations: None,
+                        max_findings_per_iteration: None,
+                        stagnation_rounds: None,
+                        validation_commands: None,
+                    },
+                });
+            }
             SlashCommand::Rename => {
                 self.otel_manager.counter("codex.thread.rename", 1, &[]);
                 self.show_rename_prompt();
@@ -3862,6 +3874,25 @@ impl ChatWidget {
                             instructions: prepared_args,
                         },
                         user_facing_hint: None,
+                    },
+                });
+                self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::AutoReview if !trimmed.is_empty() => {
+                let Some((prepared_args, _prepared_elements)) =
+                    self.bottom_pane.prepare_inline_args_submission(false)
+                else {
+                    return;
+                };
+                self.submit_op(Op::AutoReview {
+                    request: AutoReviewRequest {
+                        target: ReviewTarget::Custom {
+                            instructions: prepared_args,
+                        },
+                        max_iterations: None,
+                        max_findings_per_iteration: None,
+                        stagnation_rounds: None,
+                        validation_commands: None,
                     },
                 });
                 self.bottom_pane.drain_pending_submission_state();
@@ -7339,7 +7370,9 @@ impl ChatWidget {
     pub(crate) fn submit_op(&mut self, op: Op) -> bool {
         // Record outbound operation for session replay fidelity.
         crate::session_log::log_outbound_op(&op);
-        if matches!(&op, Op::Review { .. }) && !self.bottom_pane.is_task_running() {
+        if matches!(&op, Op::Review { .. } | Op::AutoReview { .. })
+            && !self.bottom_pane.is_task_running()
+        {
             self.bottom_pane.set_task_running(true);
         }
         if let Err(e) = self.codex_op_tx.send(op) {
