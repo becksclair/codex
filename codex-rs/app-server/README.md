@@ -136,6 +136,7 @@ Example with notification opt-out:
 - `turn/steer` — add user input to an already in-flight turn without starting a new turn; returns the active `turnId` that accepted the input.
 - `turn/interrupt` — request cancellation of an in-flight turn by `(thread_id, turn_id)`; success is an empty `{}` response and the turn finishes with `status: "interrupted"`.
 - `review/start` — kick off Codex’s automated reviewer for a thread; responds like `turn/start` and emits `item/started`/`item/completed` notifications with `enteredReviewMode` and `exitedReviewMode` items, plus a final assistant `agentMessage` containing the review.
+- `autoReview/start` — run a bounded iterative review + fix cycle for a thread, with optional iteration and validation controls.
 - `command/exec` — run a single command under the server sandbox without starting a thread/turn (handy for utilities and validation).
 - `model/list` — list available models (set `includeHidden: true` to include entries with `hidden: true`), with reasoning effort options and optional `upgrade` model ids.
 - `experimentalFeature/list` — list feature flags with stage metadata (`beta`, `underDevelopment`, `stable`, etc.), enabled/default-enabled state, and cursor pagination. For non-beta flags, `displayName`/`description`/`announcement` are `null`.
@@ -522,6 +523,42 @@ containing an `exitedReviewMode` item with the final review text:
 ```
 
 The `review` string is plain text that already bundles the overall explanation plus a bullet list for each structured finding (matching `ThreadItem::ExitedReviewMode` in the generated schema). Use this notification to render the reviewer output in your client.
+
+### Example: Start iterative auto-review
+
+Use `autoReview/start` to run a bounded review + fix loop on a thread. This endpoint accepts the same `target` and `delivery` values as `review/start`, plus optional loop controls:
+
+- `maxIterations` (default `10`)
+- `maxFindingsPerIteration` (default `5`)
+- `stagnationRounds` (default `2`)
+- `validationCommands` (optional additional shell commands the fixer should run after each fix iteration)
+
+Example request/response:
+
+```json
+{ "method": "autoReview/start", "id": 41, "params": {
+    "threadId": "thr_123",
+    "delivery": "inline",
+    "target": { "type": "uncommittedChanges" },
+    "maxIterations": 10,
+    "maxFindingsPerIteration": 5,
+    "stagnationRounds": 2,
+    "validationCommands": ["cargo test -p codex-core"]
+} }
+{ "id": 41, "result": {
+    "turn": {
+      "id": "turn_901",
+      "status": "inProgress",
+      "items": [
+        { "type": "userMessage", "id": "turn_901", "content": [ { "type": "text", "text": "current changes" } ] }
+      ],
+      "error": null
+    },
+    "reviewThreadId": "thr_123"
+} }
+```
+
+Detached delivery (`"delivery": "detached"`) behaves like `review/start`: the server forks a new thread, emits `thread/started` for it, and returns that id in `reviewThreadId`.
 
 ### Example: One-off command execution
 

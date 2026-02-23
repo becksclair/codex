@@ -272,6 +272,10 @@ client_request_definitions! {
         params: v2::ReviewStartParams,
         response: v2::ReviewStartResponse,
     },
+    AutoReviewStart => "autoReview/start" {
+        params: v2::AutoReviewStartParams,
+        response: v2::AutoReviewStartResponse,
+    },
 
     ModelList => "model/list" {
         params: v2::ModelListParams,

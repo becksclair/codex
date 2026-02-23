@@ -29,6 +29,8 @@ use codex_app_server_protocol::ArchiveConversationResponse;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::AuthStatusChangeNotification;
+use codex_app_server_protocol::AutoReviewStartParams;
+use codex_app_server_protocol::AutoReviewStartResponse;
 use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::CancelLoginAccountResponse;
 use codex_app_server_protocol::CancelLoginAccountStatus;
@@ -234,6 +236,7 @@ use codex_protocol::dynamic_tools::DynamicToolSpec as CoreDynamicToolSpec;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::AutoReviewRequest;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo as CoreGitInfo;
 use codex_protocol::protocol::InitialHistory;
@@ -529,6 +532,26 @@ impl CodexMessageProcessor {
         Ok((review_request, hint))
     }
 
+    fn auto_review_request_from_params(
+        target: ApiReviewTarget,
+        max_iterations: Option<u8>,
+        max_findings_per_iteration: Option<u16>,
+        stagnation_rounds: Option<u8>,
+        validation_commands: Option<Vec<String>>,
+    ) -> Result<(AutoReviewRequest, String), JSONRPCErrorError> {
+        let (review_request, hint) = Self::review_request_from_target(target)?;
+        Ok((
+            AutoReviewRequest {
+                target: review_request.target,
+                max_iterations,
+                max_findings_per_iteration,
+                stagnation_rounds,
+                validation_commands,
+            },
+            hint,
+        ))
+    }
+
     pub async fn process_request(&mut self, connection_id: ConnectionId, request: ClientRequest) {
         let to_connection_request_id = |request_id| ConnectionRequestId {
             connection_id,
@@ -625,6 +648,10 @@ impl CodexMessageProcessor {
             }
             ClientRequest::ReviewStart { request_id, params } => {
                 self.review_start(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::AutoReviewStart { request_id, params } => {
+                self.auto_review_start(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::NewConversation { request_id, params } => {
@@ -5545,6 +5572,30 @@ impl CodexMessageProcessor {
             .await;
     }
 
+    async fn emit_auto_review_started(
+        &self,
+        request_id: &ConnectionRequestId,
+        turn: Turn,
+        parent_thread_id: String,
+        review_thread_id: String,
+    ) {
+        let response = AutoReviewStartResponse {
+            turn: turn.clone(),
+            review_thread_id,
+        };
+        self.outgoing
+            .send_response(request_id.clone(), response)
+            .await;
+
+        let notif = TurnStartedNotification {
+            thread_id: parent_thread_id,
+            turn,
+        };
+        self.outgoing
+            .send_server_notification(ServerNotification::TurnStarted(notif))
+            .await;
+    }
+
     async fn start_inline_review(
         &self,
         request_id: &ConnectionRequestId,
@@ -5687,6 +5738,139 @@ impl CodexMessageProcessor {
         Ok(())
     }
 
+    async fn start_inline_auto_review(
+        &self,
+        request_id: &ConnectionRequestId,
+        parent_thread: Arc<CodexThread>,
+        request: AutoReviewRequest,
+        display_text: &str,
+        parent_thread_id: String,
+    ) -> std::result::Result<(), JSONRPCErrorError> {
+        let turn_id = parent_thread.submit(Op::AutoReview { request }).await;
+
+        match turn_id {
+            Ok(turn_id) => {
+                let turn = Self::build_review_turn(turn_id, display_text);
+                self.emit_auto_review_started(
+                    request_id,
+                    turn,
+                    parent_thread_id.clone(),
+                    parent_thread_id,
+                )
+                .await;
+                Ok(())
+            }
+            Err(err) => Err(JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to start auto-review: {err}"),
+                data: None,
+            }),
+        }
+    }
+
+    async fn start_detached_auto_review(
+        &mut self,
+        request_id: &ConnectionRequestId,
+        parent_thread_id: ThreadId,
+        parent_thread: Arc<CodexThread>,
+        request: AutoReviewRequest,
+        display_text: &str,
+    ) -> std::result::Result<(), JSONRPCErrorError> {
+        let rollout_path = if let Some(path) = parent_thread.rollout_path() {
+            path
+        } else {
+            find_thread_path_by_id_str(&self.config.codex_home, &parent_thread_id.to_string())
+                .await
+                .map_err(|err| JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    message: format!("failed to locate thread id {parent_thread_id}: {err}"),
+                    data: None,
+                })?
+                .ok_or_else(|| JSONRPCErrorError {
+                    code: INVALID_REQUEST_ERROR_CODE,
+                    message: format!("no rollout found for thread id {parent_thread_id}"),
+                    data: None,
+                })?
+        };
+
+        let mut config = self.config.as_ref().clone();
+        if let Some(review_model) = &config.review_model {
+            config.model = Some(review_model.clone());
+        }
+
+        let NewThread {
+            thread_id,
+            thread: review_thread,
+            session_configured,
+            ..
+        } = self
+            .thread_manager
+            .fork_thread(usize::MAX, config, rollout_path, false)
+            .await
+            .map_err(|err| JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("error creating detached review thread: {err}"),
+                data: None,
+            })?;
+
+        if let Err(err) = self
+            .ensure_conversation_listener(
+                thread_id,
+                request_id.connection_id,
+                false,
+                ApiVersion::V2,
+            )
+            .await
+        {
+            tracing::warn!(
+                "failed to attach listener for review thread {}: {}",
+                thread_id,
+                err.message
+            );
+        }
+
+        let fallback_provider = self.config.model_provider_id.as_str();
+        if let Some(rollout_path) = review_thread.rollout_path() {
+            match read_summary_from_rollout(rollout_path.as_path(), fallback_provider).await {
+                Ok(summary) => {
+                    let thread = summary_to_thread(summary);
+                    let notif = ThreadStartedNotification { thread };
+                    self.outgoing
+                        .send_server_notification(ServerNotification::ThreadStarted(notif))
+                        .await;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to load summary for review thread {}: {}",
+                        session_configured.session_id,
+                        err
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                "review thread {} has no rollout path",
+                session_configured.session_id
+            );
+        }
+
+        let turn_id = review_thread
+            .submit(Op::AutoReview { request })
+            .await
+            .map_err(|err| JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to start detached auto-review turn: {err}"),
+                data: None,
+            })?;
+
+        let turn = Self::build_review_turn(turn_id, display_text);
+        let review_thread_id = thread_id.to_string();
+        self.emit_auto_review_started(request_id, turn, review_thread_id.clone(), review_thread_id)
+            .await;
+
+        Ok(())
+    }
+
     async fn review_start(&mut self, request_id: ConnectionRequestId, params: ReviewStartParams) {
         let ReviewStartParams {
             thread_id,
@@ -5732,6 +5916,75 @@ impl CodexMessageProcessor {
                         parent_thread_id,
                         parent_thread,
                         review_request,
+                        display_text.as_str(),
+                    )
+                    .await
+                {
+                    self.outgoing.send_error(request_id, err).await;
+                }
+            }
+        }
+    }
+
+    async fn auto_review_start(
+        &mut self,
+        request_id: ConnectionRequestId,
+        params: AutoReviewStartParams,
+    ) {
+        let AutoReviewStartParams {
+            thread_id,
+            target,
+            delivery,
+            max_iterations,
+            max_findings_per_iteration,
+            stagnation_rounds,
+            validation_commands,
+        } = params;
+        let (parent_thread_id, parent_thread) = match self.load_thread(&thread_id).await {
+            Ok(v) => v,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+        };
+
+        let (request, display_text) = match Self::auto_review_request_from_params(
+            target,
+            max_iterations,
+            max_findings_per_iteration,
+            stagnation_rounds,
+            validation_commands,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                self.outgoing.send_error(request_id, err).await;
+                return;
+            }
+        };
+
+        let delivery = delivery.unwrap_or(ApiReviewDelivery::Inline).to_core();
+        match delivery {
+            CoreReviewDelivery::Inline => {
+                if let Err(err) = self
+                    .start_inline_auto_review(
+                        &request_id,
+                        parent_thread,
+                        request,
+                        display_text.as_str(),
+                        thread_id.clone(),
+                    )
+                    .await
+                {
+                    self.outgoing.send_error(request_id, err).await;
+                }
+            }
+            CoreReviewDelivery::Detached => {
+                if let Err(err) = self
+                    .start_detached_auto_review(
+                        &request_id,
+                        parent_thread_id,
+                        parent_thread,
+                        request,
                         display_text.as_str(),
                     )
                     .await

@@ -19,6 +19,8 @@ export type { AppsDefaultConfig } from "./AppsDefaultConfig";
 export type { AppsListParams } from "./AppsListParams";
 export type { AppsListResponse } from "./AppsListResponse";
 export type { AskForApproval } from "./AskForApproval";
+export type { AutoReviewStartParams } from "./AutoReviewStartParams";
+export type { AutoReviewStartResponse } from "./AutoReviewStartResponse";
 export type { ByteRange } from "./ByteRange";
 export type { CancelLoginAccountParams } from "./CancelLoginAccountParams";
 export type { CancelLoginAccountResponse } from "./CancelLoginAccountResponse";
