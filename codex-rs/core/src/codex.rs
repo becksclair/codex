@@ -3777,6 +3777,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::Review { review_request } => {
                 handlers::review(&sess, &config, sub.id.clone(), review_request).await;
             }
+            Op::AutoReview { request } => {
+                handlers::auto_review(&sess, sub.id.clone(), request).await;
+            }
             _ => {} // Ignore unknown ops; enum is non_exhaustive to allow extensions.
         }
     }
@@ -3797,12 +3800,14 @@ mod handlers {
     use crate::mcp::effective_mcp_servers;
     use crate::review_prompts::resolve_review_request;
     use crate::rollout::session_index;
+    use crate::tasks::AutoReviewTask;
     use crate::tasks::CompactTask;
     use crate::tasks::UndoTask;
     use crate::tasks::UserShellCommandMode;
     use crate::tasks::UserShellCommandTask;
     use crate::tasks::execute_user_shell_command;
     use codex_protocol::custom_prompts::CustomPrompt;
+    use codex_protocol::protocol::AutoReviewRequest;
     use codex_protocol::protocol::CodexErrorInfo;
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::Event;
@@ -4565,6 +4570,16 @@ mod handlers {
                 sess.send_event(&turn_context, event.msg).await;
             }
         }
+    }
+
+    pub async fn auto_review(sess: &Arc<Session>, sub_id: String, request: AutoReviewRequest) {
+        let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+        sess.maybe_emit_unknown_model_warning_for_turn(turn_context.as_ref())
+            .await;
+        sess.refresh_mcp_servers_if_requested(&turn_context).await;
+        turn_context.turn_metadata_state.spawn_git_enrichment_task();
+        sess.spawn_task(turn_context, Vec::new(), AutoReviewTask::new(request))
+            .await;
     }
 }
 
