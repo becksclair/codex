@@ -64,11 +64,11 @@ bazel-codex *args:
 
 [no-cd]
 bazel-lock-update:
-    bazel mod deps --lockfile_mode=update
+    cd {{ justfile_directory() }} && bazel mod deps --lockfile_mode=update
 
 [no-cd]
 bazel-lock-check:
-    ./scripts/check-module-bazel-lock.sh
+    cd {{ justfile_directory() }} && bash ./scripts/check-module-bazel-lock.sh
 
 bazel-test:
     bazel test //... --keep_going
