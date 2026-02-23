@@ -35,7 +35,16 @@ clippy:
 
 install:
     rustup show active-toolchain
-    cargo fetch
+    cargo build -p codex-cli --release
+    install -Dm755 target/release/codex "${HOME}/.local/bin/codex"
+    "${HOME}/.local/bin/codex" --version
+
+# Build and install Codex on Windows.
+install-windows:
+    rustup show active-toolchain
+    cargo build -p codex-cli --release
+    powershell -NoProfile -Command "$dest = Join-Path $env:USERPROFILE '.local\\bin'; New-Item -ItemType Directory -Force -Path $dest | Out-Null; Copy-Item -Force 'target/release/codex.exe' (Join-Path $dest 'codex.exe')"
+    powershell -NoProfile -Command "& (Join-Path $env:USERPROFILE '.local\\bin\\codex.exe') --version"
 
 # Run `cargo nextest` since it's faster than `cargo test`, though including
 # --no-fail-fast is important to ensure all tests are run.
