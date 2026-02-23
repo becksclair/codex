@@ -467,6 +467,13 @@ Use `review/start` to run Codex’s reviewer on the currently checked-out projec
   - `"inline"`: run the review as a new turn on the existing thread. The response’s `reviewThreadId` equals the original `threadId`, and no new `thread/started` notification is emitted.
   - `"detached"`: fork a new review thread from the parent conversation and run the review there. The response’s `reviewThreadId` is the id of this new review thread, and the server emits a `thread/started` notification for it before streaming review items.
 
+Review model/effort behavior:
+
+- If `review_model` is set in config, review and auto-review use that model.
+- Review effort uses `CODEX_REVIEW_REASONING_EFFORT` when set (`none|minimal|low|medium|high|xhigh`).
+- If the env value is missing or invalid, review effort defaults to `high`.
+- If the requested effort is unsupported by the selected review model, Codex falls back to that model's default effort (or leaves effort unset if the model advertises no reasoning levels/default).
+
 Example request/response:
 
 ```json

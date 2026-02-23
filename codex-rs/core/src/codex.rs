@@ -276,6 +276,9 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_readiness::Readiness;
 use codex_utils_readiness::ReadinessFlag;
 
+const CODEX_REVIEW_REASONING_EFFORT_ENV_VAR: &str = "CODEX_REVIEW_REASONING_EFFORT";
+const REVIEW_REASONING_EFFORT_ALLOWED_VALUES: &str = "none|minimal|low|medium|high|xhigh";
+
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
 pub struct Codex {
@@ -3778,7 +3781,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 handlers::review(&sess, &config, sub.id.clone(), review_request).await;
             }
             Op::AutoReview { request } => {
-                handlers::auto_review(&sess, sub.id.clone(), request).await;
+                handlers::auto_review(&sess, &config, sub.id.clone(), request).await;
             }
             _ => {} // Ignore unknown ops; enum is non_exhaustive to allow extensions.
         }
@@ -3786,8 +3789,113 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
     debug!("Agent loop exited");
 }
 
+struct ReviewOverrides {
+    model: String,
+    model_info: ModelInfo,
+    reasoning_effort: Option<ReasoningEffortConfig>,
+    warnings: Vec<String>,
+}
+
+async fn resolve_review_overrides(
+    sess: &Session,
+    config: &Config,
+    fallback_model: &str,
+) -> ReviewOverrides {
+    let model = config
+        .review_model
+        .clone()
+        .unwrap_or_else(|| fallback_model.to_string());
+    let model_info = sess
+        .services
+        .models_manager
+        .get_model_info(&model, config)
+        .await;
+    let (reasoning_effort, warnings) = resolve_review_reasoning_effort(&model_info);
+    ReviewOverrides {
+        model,
+        model_info,
+        reasoning_effort,
+        warnings,
+    }
+}
+
+fn resolve_review_reasoning_effort(
+    model_info: &ModelInfo,
+) -> (Option<ReasoningEffortConfig>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let requested_effort = match std::env::var(CODEX_REVIEW_REASONING_EFFORT_ENV_VAR) {
+        Ok(raw_value) if !raw_value.trim().is_empty() => {
+            match parse_review_reasoning_effort(raw_value.as_str()) {
+                Some(parsed) => parsed,
+                None => {
+                    warnings.push(format!(
+                        "`{CODEX_REVIEW_REASONING_EFFORT_ENV_VAR}` value `{raw_value}` is invalid for model `{}`; expected one of {REVIEW_REASONING_EFFORT_ALLOWED_VALUES}. Falling back to `high`.",
+                        model_info.slug
+                    ));
+                    ReasoningEffortConfig::High
+                }
+            }
+        }
+        _ => ReasoningEffortConfig::High,
+    };
+
+    let supported_levels = model_info
+        .supported_reasoning_levels
+        .iter()
+        .map(|preset| preset.effort)
+        .collect::<Vec<_>>();
+    if supported_levels.contains(&requested_effort) {
+        return (Some(requested_effort), warnings);
+    }
+
+    if let Some(fallback_effort) = model_info
+        .default_reasoning_level
+        .or_else(|| supported_levels.first().copied())
+    {
+        warnings.push(format!(
+            "`{CODEX_REVIEW_REASONING_EFFORT_ENV_VAR}` requested `{requested_effort}` for model `{}` but that level is unsupported. Falling back to model default `{fallback_effort}`.",
+            model_info.slug
+        ));
+        return (Some(fallback_effort), warnings);
+    }
+
+    warnings.push(format!(
+        "`{CODEX_REVIEW_REASONING_EFFORT_ENV_VAR}` requested `{requested_effort}` for model `{}` but that model advertises no supported/default reasoning levels; reasoning omitted for this review turn.",
+        model_info.slug
+    ));
+
+    (None, warnings)
+}
+
+fn parse_review_reasoning_effort(value: &str) -> Option<ReasoningEffortConfig> {
+    match value {
+        "none" => Some(ReasoningEffortConfig::None),
+        "minimal" => Some(ReasoningEffortConfig::Minimal),
+        "low" => Some(ReasoningEffortConfig::Low),
+        "medium" => Some(ReasoningEffortConfig::Medium),
+        "high" => Some(ReasoningEffortConfig::High),
+        "xhigh" => Some(ReasoningEffortConfig::XHigh),
+        _ => None,
+    }
+}
+
+async fn emit_review_override_warnings(
+    sess: &Session,
+    turn_context: &TurnContext,
+    warnings: Vec<String>,
+) {
+    for message in warnings {
+        warn!("{message}");
+        sess.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
+            .await;
+    }
+}
+
 /// Operation handlers
 mod handlers {
+    use super::ReviewOverrides;
+    use super::emit_review_override_warnings;
+    use super::resolve_review_overrides;
     use crate::codex::Session;
     use crate::codex::SessionSettingsUpdate;
     use crate::codex::SteerInputError;
@@ -4572,8 +4680,40 @@ mod handlers {
         }
     }
 
-    pub async fn auto_review(sess: &Arc<Session>, sub_id: String, request: AutoReviewRequest) {
-        let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+    pub async fn auto_review(
+        sess: &Arc<Session>,
+        config: &Arc<Config>,
+        sub_id: String,
+        request: AutoReviewRequest,
+    ) {
+        let mut session_configuration = {
+            let state = sess.state.lock().await;
+            state.session_configuration.clone()
+        };
+        let ReviewOverrides {
+            model,
+            reasoning_effort,
+            warnings,
+            ..
+        } = resolve_review_overrides(
+            sess.as_ref(),
+            config.as_ref(),
+            session_configuration.collaboration_mode.model(),
+        )
+        .await;
+
+        let mut per_turn_config = (*session_configuration.original_config_do_not_use).clone();
+        per_turn_config.model = Some(model.clone());
+        per_turn_config.model_reasoning_effort = reasoning_effort;
+        session_configuration.original_config_do_not_use = Arc::new(per_turn_config);
+        session_configuration.collaboration_mode = session_configuration
+            .collaboration_mode
+            .with_updates(Some(model), Some(reasoning_effort), None);
+
+        let turn_context = sess
+            .new_turn_from_configuration(sub_id, session_configuration, None, false)
+            .await;
+        emit_review_override_warnings(sess.as_ref(), turn_context.as_ref(), warnings).await;
         sess.maybe_emit_unknown_model_warning_for_turn(turn_context.as_ref())
             .await;
         sess.refresh_mcp_servers_if_requested(&turn_context).await;
@@ -4591,15 +4731,17 @@ async fn spawn_review_thread(
     sub_id: String,
     resolved: crate::review_prompts::ResolvedReviewRequest,
 ) {
-    let model = config
-        .review_model
-        .clone()
-        .unwrap_or_else(|| parent_turn_context.model_info.slug.clone());
-    let review_model_info = sess
-        .services
-        .models_manager
-        .get_model_info(&model, &config)
-        .await;
+    let ReviewOverrides {
+        model,
+        model_info: review_model_info,
+        reasoning_effort,
+        warnings,
+    } = resolve_review_overrides(
+        sess.as_ref(),
+        config.as_ref(),
+        &parent_turn_context.model_info.slug,
+    )
+    .await;
     // For reviews, disable web_search and view_image regardless of global settings.
     let mut review_features = sess.features.clone();
     review_features
@@ -4623,6 +4765,7 @@ async fn spawn_review_thread(
     // Build per‑turn client with the requested model/family.
     let mut per_turn_config = (*config).clone();
     per_turn_config.model = Some(model.clone());
+    per_turn_config.model_reasoning_effort = reasoning_effort;
     per_turn_config.features = review_features.clone();
     if let Err(err) = per_turn_config.web_search_mode.set(review_web_search_mode) {
         let fallback_value = per_turn_config.web_search_mode.value();
@@ -4641,7 +4784,6 @@ async fn spawn_review_thread(
     let auth_manager_for_context = auth_manager.clone();
     let provider_for_context = provider.clone();
     let otel_manager_for_context = otel_manager.clone();
-    let reasoning_effort = per_turn_config.model_reasoning_effort;
     let reasoning_summary = per_turn_config.model_reasoning_summary;
     let session_source = parent_turn_context.session_source.clone();
 
@@ -4673,7 +4815,11 @@ async fn spawn_review_thread(
         developer_instructions: None,
         user_instructions: None,
         compact_prompt: parent_turn_context.compact_prompt.clone(),
-        collaboration_mode: parent_turn_context.collaboration_mode.clone(),
+        collaboration_mode: parent_turn_context.collaboration_mode.with_updates(
+            Some(model.clone()),
+            Some(reasoning_effort),
+            None,
+        ),
         personality: parent_turn_context.personality,
         approval_policy: parent_turn_context.approval_policy.clone(),
         sandbox_policy: parent_turn_context.sandbox_policy.clone(),
@@ -4698,6 +4844,7 @@ async fn spawn_review_thread(
         text_elements: Vec::new(),
     }];
     let tc = Arc::new(review_turn_context);
+    emit_review_override_warnings(sess.as_ref(), tc.as_ref(), warnings).await;
     tc.turn_metadata_state.spawn_git_enrichment_task();
     // TODO(ccunningham): Review turns currently rely on `spawn_task` for TurnComplete but do not
     // emit a parent TurnStarted. Consider giving review a full parent turn lifecycle
