@@ -141,13 +141,7 @@ pub fn load_skills(config: &Config) -> SkillLoadOutcome {
 }
 
 fn load_skills_with_home_dir(config: &Config, home_dir: Option<&Path>) -> SkillLoadOutcome {
-    let mut roots = skill_roots_from_layer_stack_inner(&config.config_layer_stack, home_dir);
-    roots.extend(repo_agents_skill_roots(
-        &config.config_layer_stack,
-        &config.cwd,
-    ));
-    dedupe_skill_roots_by_path(&mut roots);
-    load_skills_from_roots(roots)
+    load_skills_from_roots(skill_roots_with_home_dir(config, home_dir))
 }
 
 pub(crate) struct SkillRoot {
@@ -250,9 +244,12 @@ fn skill_roots_from_layer_stack_inner(
     roots
 }
 
-#[cfg(test)]
-fn skill_roots(config: &Config) -> Vec<SkillRoot> {
-    skill_roots_from_layer_stack_with_agents(&config.config_layer_stack, &config.cwd)
+fn skill_roots_with_home_dir(config: &Config, home_dir: Option<&Path>) -> Vec<SkillRoot> {
+    skill_roots_from_layer_stack_with_agents_inner(
+        &config.config_layer_stack,
+        &config.cwd,
+        home_dir,
+    )
 }
 
 #[cfg(test)]
@@ -267,7 +264,15 @@ pub(crate) fn skill_roots_from_layer_stack_with_agents(
     config_layer_stack: &ConfigLayerStack,
     cwd: &Path,
 ) -> Vec<SkillRoot> {
-    let mut roots = skill_roots_from_layer_stack_inner(config_layer_stack, home_dir().as_deref());
+    skill_roots_from_layer_stack_with_agents_inner(config_layer_stack, cwd, home_dir().as_deref())
+}
+
+fn skill_roots_from_layer_stack_with_agents_inner(
+    config_layer_stack: &ConfigLayerStack,
+    cwd: &Path,
+    home_dir: Option<&Path>,
+) -> Vec<SkillRoot> {
+    let mut roots = skill_roots_from_layer_stack_inner(config_layer_stack, home_dir);
     roots.extend(repo_agents_skill_roots(config_layer_stack, cwd));
     dedupe_skill_roots_by_path(&mut roots);
     roots
@@ -2599,10 +2604,11 @@ permissions:
         let codex_home = tempfile::tempdir().expect("tempdir");
         let cfg = make_config(&codex_home).await;
 
-        let scopes: Vec<SkillScope> = skill_roots(&cfg)
-            .into_iter()
-            .map(|root| root.scope)
-            .collect();
+        let scopes: Vec<SkillScope> =
+            skill_roots_with_home_dir(&cfg, Some(cfg.codex_home.as_path()))
+                .into_iter()
+                .map(|root| root.scope)
+                .collect();
         let mut expected = vec![SkillScope::User, SkillScope::System];
         if home_dir().is_some() {
             expected.insert(1, SkillScope::User);
