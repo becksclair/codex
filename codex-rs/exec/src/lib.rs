@@ -10,6 +10,7 @@ mod event_processor_with_human_output;
 pub mod event_processor_with_jsonl_output;
 pub mod exec_events;
 
+pub use cli::AutoReviewArgs;
 pub use cli::Cli;
 pub use cli::Command;
 pub use cli::ReviewArgs;
@@ -36,6 +37,7 @@ use codex_core::models_manager::manager::RefreshStrategy;
 use codex_protocol::approvals::ElicitationAction;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::AutoReviewRequest;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -80,6 +82,9 @@ enum InitialOperation {
     },
     Review {
         review_request: ReviewRequest,
+    },
+    AutoReview {
+        request: AutoReviewRequest,
     },
 }
 
@@ -423,6 +428,11 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         thread_manager.start_thread(config.clone()).await?
     };
     let (initial_operation, prompt_summary) = match (command, prompt, images) {
+        (Some(ExecCommand::AutoReview(auto_review_cli)), _, _) => {
+            let request = build_auto_review_request(auto_review_cli)?;
+            let summary = codex_core::review_prompts::user_facing_hint(&request.target);
+            (InitialOperation::AutoReview { request }, summary)
+        }
         (Some(ExecCommand::Review(review_cli)), _, _) => {
             let review_request = build_review_request(review_cli)?;
             let summary = codex_core::review_prompts::user_facing_hint(&review_request.target);
@@ -566,6 +576,11 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         InitialOperation::Review { review_request } => {
             let task_id = thread.submit(Op::Review { review_request }).await?;
             info!("Sent review request with event ID: {task_id}");
+            task_id
+        }
+        InitialOperation::AutoReview { request } => {
+            let task_id = thread.submit(Op::AutoReview { request }).await?;
+            info!("Sent auto-review request with event ID: {task_id}");
             task_id
         }
     };
@@ -916,6 +931,28 @@ fn build_review_request(args: ReviewArgs) -> anyhow::Result<ReviewRequest> {
     })
 }
 
+fn build_auto_review_request(args: AutoReviewArgs) -> anyhow::Result<AutoReviewRequest> {
+    let review_request = build_review_request(ReviewArgs {
+        uncommitted: args.uncommitted,
+        base: args.base,
+        commit: args.commit,
+        commit_title: args.commit_title,
+        prompt: args.prompt,
+    })?;
+    let validation_commands = if args.validation_commands.is_empty() {
+        None
+    } else {
+        Some(args.validation_commands)
+    };
+    Ok(AutoReviewRequest {
+        target: review_request.target,
+        max_iterations: Some(args.max_iterations),
+        max_findings_per_iteration: Some(args.max_findings_per_iteration),
+        stagnation_rounds: Some(args.stagnation_rounds),
+        validation_commands,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -978,6 +1015,32 @@ mod tests {
                 instructions: "custom review instructions".to_string(),
             },
             user_facing_hint: None,
+        };
+
+        assert_eq!(request, expected);
+    }
+
+    #[test]
+    fn builds_auto_review_request_with_defaults() {
+        let request = build_auto_review_request(AutoReviewArgs {
+            uncommitted: true,
+            base: None,
+            commit: None,
+            commit_title: None,
+            prompt: None,
+            max_iterations: 10,
+            max_findings_per_iteration: 5,
+            stagnation_rounds: 2,
+            validation_commands: Vec::new(),
+        })
+        .expect("builds auto-review request");
+
+        let expected = AutoReviewRequest {
+            target: ReviewTarget::UncommittedChanges,
+            max_iterations: Some(10),
+            max_findings_per_iteration: Some(5),
+            stagnation_rounds: Some(2),
+            validation_commands: None,
         };
 
         assert_eq!(request, expected);
