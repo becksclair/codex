@@ -519,7 +519,9 @@ impl Tui {
             terminal.draw(|frame| {
                 draw_fn(frame);
             })
-        })?
+        })??;
+
+        Ok(())
     }
 
     fn pending_viewport_area(&mut self) -> Result<Option<Rect>> {
