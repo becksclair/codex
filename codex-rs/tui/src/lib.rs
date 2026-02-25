@@ -115,9 +115,15 @@ pub mod update_action;
 mod update_prompt;
 mod updates;
 mod version;
-#[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
+#[cfg(all(
+    feature = "voice-input",
+    any(not(target_os = "linux"), target_env = "gnu")
+))]
 mod voice;
-#[cfg(all(not(target_os = "linux"), not(feature = "voice-input")))]
+#[cfg(not(all(
+    feature = "voice-input",
+    any(not(target_os = "linux"), target_env = "gnu")
+)))]
 mod voice {
     use crate::app_event::AppEvent;
     use crate::app_event_sender::AppEventSender;
@@ -184,7 +190,7 @@ mod voice {
     }
 
     impl RealtimeAudioPlayer {
-        pub(crate) fn start() -> Result<Self, String> {
+        pub(crate) fn start(_tx: AppEventSender) -> Result<Self, String> {
             Err("voice output is unavailable in this build".to_string())
         }
 

@@ -24,12 +24,10 @@ pub(super) struct RealtimeConversationUiState {
     session_id: Option<String>,
     warned_audio_only_submission: bool,
     meter_placeholder_id: Option<String>,
-    #[cfg(not(target_os = "linux"))]
     capture_stop_flag: Option<Arc<AtomicBool>>,
-    #[cfg(not(target_os = "linux"))]
     capture: Option<crate::voice::VoiceCapture>,
-    #[cfg(not(target_os = "linux"))]
     audio_player: Option<crate::voice::RealtimeAudioPlayer>,
+    audio_retry_attempted: bool,
 }
 
 impl RealtimeConversationUiState {
@@ -115,10 +113,20 @@ impl ChatWidget {
     }
 
     pub(super) fn start_realtime_conversation(&mut self) {
+        if self.bottom_pane.is_recording() {
+            self.add_info_message(
+                "Stop voice transcription recording before starting /realtime.".to_string(),
+                None,
+            );
+            return;
+        }
+
         self.realtime_conversation.phase = RealtimeConversationPhase::Starting;
         self.realtime_conversation.requested_close = false;
         self.realtime_conversation.session_id = None;
         self.realtime_conversation.warned_audio_only_submission = false;
+        self.realtime_conversation.audio_retry_attempted = false;
+        self.bottom_pane.set_realtime_conversation_live(true);
         self.set_footer_hint_override(Some(Self::realtime_footer_hint_items()));
         self.submit_op(Op::RealtimeConversationStart(ConversationStartParams {
             prompt: REALTIME_CONVERSATION_PROMPT.to_string(),
@@ -150,11 +158,13 @@ impl ChatWidget {
 
     pub(super) fn reset_realtime_conversation_state(&mut self) {
         self.stop_realtime_local_audio();
+        self.bottom_pane.set_realtime_conversation_live(false);
         self.set_footer_hint_override(None);
         self.realtime_conversation.phase = RealtimeConversationPhase::Inactive;
         self.realtime_conversation.requested_close = false;
         self.realtime_conversation.session_id = None;
         self.realtime_conversation.warned_audio_only_submission = false;
+        self.realtime_conversation.audio_retry_attempted = false;
     }
 
     pub(super) fn on_realtime_conversation_started(
@@ -166,11 +176,16 @@ impl ChatWidget {
             self.reset_realtime_conversation_state();
             return;
         }
-        self.realtime_conversation.phase = RealtimeConversationPhase::Active;
         self.realtime_conversation.session_id = ev.session_id;
         self.realtime_conversation.warned_audio_only_submission = false;
         self.set_footer_hint_override(Some(Self::realtime_footer_hint_items()));
-        self.start_realtime_local_audio();
+        if let Err(err) = self.start_realtime_local_audio() {
+            self.request_realtime_conversation_close(Some(format!(
+                "Realtime voice mode closed: failed to start local audio: {err}"
+            )));
+            return;
+        }
+        self.realtime_conversation.phase = RealtimeConversationPhase::Active;
         self.request_redraw();
     }
 
@@ -202,29 +217,64 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn enqueue_realtime_audio_out(&mut self, frame: &RealtimeAudioFrame) {
-        #[cfg(not(target_os = "linux"))]
+    pub(crate) fn on_realtime_audio_runtime_error(&mut self, message: String) {
+        if !self.realtime_conversation.is_live()
+            || self.realtime_conversation.requested_close
+            || matches!(
+                self.realtime_conversation.phase,
+                RealtimeConversationPhase::Stopping
+            )
         {
-            if self.realtime_conversation.audio_player.is_none() {
-                self.realtime_conversation.audio_player =
-                    crate::voice::RealtimeAudioPlayer::start().ok();
+            return;
+        }
+
+        if !self.realtime_conversation.audio_retry_attempted {
+            self.realtime_conversation.audio_retry_attempted = true;
+            self.add_info_message(
+                "Realtime audio encountered an issue; retrying once.".to_string(),
+                None,
+            );
+
+            if let Err(err) = self.restart_realtime_local_audio() {
+                self.request_realtime_conversation_close(Some(format!(
+                    "Realtime voice mode closed: {err}"
+                )));
+            } else {
+                self.request_redraw();
             }
-            if let Some(player) = &self.realtime_conversation.audio_player
-                && let Err(err) = player.enqueue_frame(frame)
-            {
-                warn!("failed to play realtime audio: {err}");
+            return;
+        }
+
+        self.request_realtime_conversation_close(Some(format!(
+            "Realtime voice mode closed: {message}"
+        )));
+    }
+
+    fn enqueue_realtime_audio_out(&mut self, frame: &RealtimeAudioFrame) {
+        if self.realtime_conversation.audio_player.is_none() {
+            match crate::voice::RealtimeAudioPlayer::start(self.app_event_tx.clone()) {
+                Ok(player) => {
+                    self.realtime_conversation.audio_player = Some(player);
+                }
+                Err(err) => {
+                    self.on_realtime_audio_runtime_error(format!(
+                        "failed to initialize local speaker output: {err}"
+                    ));
+                    return;
+                }
             }
         }
-        #[cfg(target_os = "linux")]
+        if let Some(player) = &self.realtime_conversation.audio_player
+            && let Err(err) = player.enqueue_frame(frame)
         {
-            let _ = frame;
+            warn!("failed to play realtime audio: {err}");
+            self.on_realtime_audio_runtime_error(format!("failed to play realtime audio: {err}"));
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn start_realtime_local_audio(&mut self) {
+    fn start_realtime_local_audio(&mut self) -> Result<(), String> {
         if self.realtime_conversation.capture_stop_flag.is_some() {
-            return;
+            return Ok(());
         }
 
         let placeholder_id = self.bottom_pane.insert_transcription_placeholder("⠤⠤⠤⠤");
@@ -236,8 +286,7 @@ impl ChatWidget {
             Err(err) => {
                 self.remove_transcription_placeholder(&placeholder_id);
                 self.realtime_conversation.meter_placeholder_id = None;
-                self.add_error_message(format!("Failed to start microphone capture: {err}"));
-                return;
+                return Err(format!("failed to start microphone capture: {err}"));
             }
         };
 
@@ -249,8 +298,22 @@ impl ChatWidget {
         self.realtime_conversation.capture_stop_flag = Some(stop_flag.clone());
         self.realtime_conversation.capture = Some(capture);
         if self.realtime_conversation.audio_player.is_none() {
-            self.realtime_conversation.audio_player =
-                crate::voice::RealtimeAudioPlayer::start().ok();
+            let player = match crate::voice::RealtimeAudioPlayer::start(self.app_event_tx.clone()) {
+                Ok(player) => player,
+                Err(err) => {
+                    if let Some(flag) = self.realtime_conversation.capture_stop_flag.take() {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(capture) = self.realtime_conversation.capture.take() {
+                        let _ = capture.stop();
+                    }
+                    if let Some(id) = self.realtime_conversation.meter_placeholder_id.take() {
+                        self.remove_transcription_placeholder(&id);
+                    }
+                    return Err(format!("failed to start speaker output: {err}"));
+                }
+            };
+            self.realtime_conversation.audio_player = Some(player);
         }
 
         std::thread::spawn(move || {
@@ -270,12 +333,10 @@ impl ChatWidget {
                 std::thread::sleep(Duration::from_millis(60));
             }
         });
+
+        Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    fn start_realtime_local_audio(&mut self) {}
-
-    #[cfg(not(target_os = "linux"))]
     fn stop_realtime_local_audio(&mut self) {
         if let Some(flag) = self.realtime_conversation.capture_stop_flag.take() {
             flag.store(true, Ordering::Relaxed);
@@ -291,8 +352,8 @@ impl ChatWidget {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    fn stop_realtime_local_audio(&mut self) {
-        self.realtime_conversation.meter_placeholder_id = None;
+    fn restart_realtime_local_audio(&mut self) -> Result<(), String> {
+        self.stop_realtime_local_audio();
+        self.start_realtime_local_audio()
     }
 }

@@ -858,7 +858,7 @@ enum ReplayKind {
 impl ChatWidget {
     fn realtime_conversation_enabled(&self) -> bool {
         self.config.features.enabled(Feature::RealtimeConversation)
-            && cfg!(not(target_os = "linux"))
+            && cfg!(any(not(target_os = "linux"), target_env = "gnu"))
     }
 
     /// Synchronize the bottom-pane "task running" indicator with the current lifecycles.
@@ -6573,6 +6573,8 @@ impl ChatWidget {
             let realtime_conversation_enabled = self.realtime_conversation_enabled();
             self.bottom_pane
                 .set_realtime_conversation_enabled(realtime_conversation_enabled);
+            self.bottom_pane
+                .set_realtime_conversation_live(self.realtime_conversation.is_live());
             if !realtime_conversation_enabled && self.realtime_conversation.is_live() {
                 self.request_realtime_conversation_close(Some(
                     "Realtime voice mode was closed because the feature was disabled.".to_string(),
@@ -7735,7 +7737,6 @@ impl ChatWidget {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
 impl ChatWidget {
     pub(crate) fn replace_transcription(&mut self, id: &str, text: &str) {
         self.bottom_pane.replace_transcription(id, text);

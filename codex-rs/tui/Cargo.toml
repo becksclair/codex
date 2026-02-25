@@ -107,7 +107,7 @@ uuid = { workspace = true }
 codex-windows-sandbox = { workspace = true }
 tokio-util = { workspace = true, features = ["time"] }
 
-[target.'cfg(not(target_os = "linux"))'.dependencies]
+[target.'cfg(any(not(target_os = "linux"), all(target_os = "linux", target_env = "gnu")))'.dependencies]
 cpal = { version = "0.15", optional = true }
 hound = { version = "3.5", optional = true }
 

@@ -339,38 +339,68 @@ fn build_realtime_input_stream(
         cpal::SampleFormat::F32 => device
             .build_input_stream(
                 &config.clone().into(),
-                move |input: &[f32], _| {
-                    let peak = peak_f32(input);
-                    last_peak.store(peak, Ordering::Relaxed);
-                    let samples = input.iter().copied().map(f32_to_i16).collect::<Vec<_>>();
-                    send_realtime_audio_chunk(&tx, samples, sample_rate, channels);
+                {
+                    let tx_audio = tx.clone();
+                    move |input: &[f32], _| {
+                        let peak = peak_f32(input);
+                        last_peak.store(peak, Ordering::Relaxed);
+                        let samples = input.iter().copied().map(f32_to_i16).collect::<Vec<_>>();
+                        send_realtime_audio_chunk(&tx_audio, samples, sample_rate, channels);
+                    }
                 },
-                move |err| error!("audio input error: {err}"),
+                {
+                    let tx_error = tx;
+                    move |err| {
+                        let message = format!("realtime microphone stream error: {err}");
+                        error!("{message}");
+                        tx_error.send(AppEvent::RealtimeAudioRuntimeError { message });
+                    }
+                },
                 None,
             )
             .map_err(|e| format!("failed to build input stream: {e}")),
         cpal::SampleFormat::I16 => device
             .build_input_stream(
                 &config.clone().into(),
-                move |input: &[i16], _| {
-                    let peak = peak_i16(input);
-                    last_peak.store(peak, Ordering::Relaxed);
-                    send_realtime_audio_chunk(&tx, input.to_vec(), sample_rate, channels);
+                {
+                    let tx_audio = tx.clone();
+                    move |input: &[i16], _| {
+                        let peak = peak_i16(input);
+                        last_peak.store(peak, Ordering::Relaxed);
+                        send_realtime_audio_chunk(&tx_audio, input.to_vec(), sample_rate, channels);
+                    }
                 },
-                move |err| error!("audio input error: {err}"),
+                {
+                    let tx_error = tx;
+                    move |err| {
+                        let message = format!("realtime microphone stream error: {err}");
+                        error!("{message}");
+                        tx_error.send(AppEvent::RealtimeAudioRuntimeError { message });
+                    }
+                },
                 None,
             )
             .map_err(|e| format!("failed to build input stream: {e}")),
         cpal::SampleFormat::U16 => device
             .build_input_stream(
                 &config.clone().into(),
-                move |input: &[u16], _| {
-                    let mut samples = Vec::with_capacity(input.len());
-                    let peak = convert_u16_to_i16_and_peak(input, &mut samples);
-                    last_peak.store(peak, Ordering::Relaxed);
-                    send_realtime_audio_chunk(&tx, samples, sample_rate, channels);
+                {
+                    let tx_audio = tx.clone();
+                    move |input: &[u16], _| {
+                        let mut samples = Vec::with_capacity(input.len());
+                        let peak = convert_u16_to_i16_and_peak(input, &mut samples);
+                        last_peak.store(peak, Ordering::Relaxed);
+                        send_realtime_audio_chunk(&tx_audio, samples, sample_rate, channels);
+                    }
                 },
-                move |err| error!("audio input error: {err}"),
+                {
+                    let tx_error = tx;
+                    move |err| {
+                        let message = format!("realtime microphone stream error: {err}");
+                        error!("{message}");
+                        tx_error.send(AppEvent::RealtimeAudioRuntimeError { message });
+                    }
+                },
                 None,
             )
             .map_err(|e| format!("failed to build input stream: {e}")),
@@ -466,7 +496,7 @@ pub(crate) struct RealtimeAudioPlayer {
 }
 
 impl RealtimeAudioPlayer {
-    pub(crate) fn start() -> Result<Self, String> {
+    pub(crate) fn start(tx: AppEventSender) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -477,7 +507,7 @@ impl RealtimeAudioPlayer {
         let output_sample_rate = config.sample_rate().0;
         let output_channels = config.channels();
         let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let stream = build_output_stream(&device, &config, Arc::clone(&queue))?;
+        let stream = build_output_stream(&device, &config, Arc::clone(&queue), tx)?;
         stream
             .play()
             .map_err(|e| format!("failed to start output stream: {e}"))?;
@@ -533,6 +563,7 @@ fn build_output_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
     queue: Arc<Mutex<VecDeque<i16>>>,
+    tx: AppEventSender,
 ) -> Result<cpal::Stream, String> {
     let config_any: cpal::StreamConfig = config.clone().into();
     match config.sample_format() {
@@ -540,7 +571,14 @@ fn build_output_stream(
             .build_output_stream(
                 &config_any,
                 move |output: &mut [f32], _| fill_output_f32(output, &queue),
-                move |err| error!("audio output error: {err}"),
+                {
+                    let tx = tx;
+                    move |err| {
+                        let message = format!("realtime speaker stream error: {err}");
+                        error!("{message}");
+                        tx.send(AppEvent::RealtimeAudioRuntimeError { message });
+                    }
+                },
                 None,
             )
             .map_err(|e| format!("failed to build f32 output stream: {e}")),
@@ -548,7 +586,14 @@ fn build_output_stream(
             .build_output_stream(
                 &config_any,
                 move |output: &mut [i16], _| fill_output_i16(output, &queue),
-                move |err| error!("audio output error: {err}"),
+                {
+                    let tx = tx;
+                    move |err| {
+                        let message = format!("realtime speaker stream error: {err}");
+                        error!("{message}");
+                        tx.send(AppEvent::RealtimeAudioRuntimeError { message });
+                    }
+                },
                 None,
             )
             .map_err(|e| format!("failed to build i16 output stream: {e}")),
@@ -556,7 +601,11 @@ fn build_output_stream(
             .build_output_stream(
                 &config_any,
                 move |output: &mut [u16], _| fill_output_u16(output, &queue),
-                move |err| error!("audio output error: {err}"),
+                move |err| {
+                    let message = format!("realtime speaker stream error: {err}");
+                    error!("{message}");
+                    tx.send(AppEvent::RealtimeAudioRuntimeError { message });
+                },
                 None,
             )
             .map_err(|e| format!("failed to build u16 output stream: {e}")),
