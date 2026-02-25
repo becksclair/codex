@@ -48,6 +48,16 @@ Use `codex mcp` to add/list/get/remove MCP server launchers defined in `config.t
 
 You can enable notifications by configuring a script that is run whenever the agent finishes a turn. The [notify documentation](../docs/config.md#notify) includes a detailed example that explains how to get desktop notifications via [terminal-notifier](https://github.com/julienXX/terminal-notifier) on macOS. When Codex detects that it is running under WSL 2 inside Windows Terminal (`WT_SESSION` is set), the TUI automatically falls back to native Windows toast notifications so approval prompts and completed turns surface even though Windows Terminal does not implement OSC 9.
 
+### Experimental voice features
+
+The TUI includes two experimental voice features behind feature flags:
+
+- `voice_transcription` enables hold-to-talk transcription in the composer.
+- `realtime_conversation` enables `/realtime` live voice mode.
+
+Both remain disabled by default. Linux local audio support currently targets GNU
+toolchains (`*-unknown-linux-gnu`).
+
 ### `codex exec` to run Codex programmatically/non-interactively
 
 To run Codex non-interactively, run `codex exec PROMPT` (you can also pass the prompt via `stdin`) and Codex will work on your task until it decides that it is done and exits. Output is printed to the terminal directly. You can set the `RUST_LOG` environment variable to see more about what's going on.
