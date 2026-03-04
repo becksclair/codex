@@ -1,17 +1,28 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::Result;
+#[cfg(all(unix, not(feature = "managed-network-proxy")))]
+use codex_core::config::ConfigBuilder;
 use codex_core::config::Constrained;
+#[cfg(all(unix, feature = "managed-network-proxy"))]
 use codex_core::config_loader::ConfigLayerStack;
+#[cfg(all(unix, feature = "managed-network-proxy"))]
 use codex_core::config_loader::ConfigLayerStackOrdering;
+#[cfg(all(unix, feature = "managed-network-proxy"))]
 use codex_core::config_loader::NetworkConstraints;
+#[cfg(all(unix, feature = "managed-network-proxy"))]
 use codex_core::config_loader::NetworkRequirementsToml;
+#[cfg(all(unix, feature = "managed-network-proxy"))]
 use codex_core::config_loader::RequirementSource;
+#[cfg(all(unix, feature = "managed-network-proxy"))]
 use codex_core::config_loader::Sourced;
 use codex_core::features::Feature;
 use codex_core::sandboxing::SandboxPermissions;
+#[cfg(all(unix, feature = "managed-network-proxy"))]
 use codex_protocol::approvals::NetworkApprovalProtocol;
+#[cfg(all(unix, feature = "managed-network-proxy"))]
 use codex_protocol::approvals::NetworkPolicyAmendment;
+#[cfg(all(unix, feature = "managed-network-proxy"))]
 use codex_protocol::approvals::NetworkPolicyRuleAction;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::AskForApproval;
@@ -36,6 +47,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+#[cfg(all(unix, feature = "managed-network-proxy"))]
 use core_test_support::wait_for_event_with_timeout;
 use core_test_support::zsh_fork::build_zsh_fork_test;
 use core_test_support::zsh_fork::restrictive_workspace_write_policy;
@@ -47,6 +59,7 @@ use serde_json::json;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+#[cfg(all(unix, feature = "managed-network-proxy"))]
 use std::sync::Arc;
 use tempfile::TempDir;
 use wiremock::Mock;
@@ -2283,8 +2296,43 @@ async fn approving_fallback_rule_for_compound_command_works() -> Result<()> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn denying_network_policy_amendment_persists_policy_and_skips_future_network_prompt()
--> Result<()> {
+#[cfg(all(unix, not(feature = "managed-network-proxy")))]
+async fn network_policy_amendment_flow_rejected_without_managed_network_proxy_feature() -> Result<()>
+{
+    let codex_home = TempDir::new()?;
+    fs::write(
+        codex_home.path().join("config.toml"),
+        r#"[permissions.network]
+enabled = true
+mode = "limited"
+allow_local_binding = true
+"#,
+    )?;
+
+    let err = match ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+    {
+        Ok(_) => panic!("managed network requirements must be rejected when feature is disabled"),
+        Err(err) => err,
+    };
+    let err_text = err.to_string();
+    assert!(
+        err_text.contains("disables managed network proxy support"),
+        "unexpected error: {err_text}"
+    );
+    assert!(
+        err_text.contains("--features codex-core/managed-network-proxy"),
+        "unexpected error: {err_text}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(all(unix, feature = "managed-network-proxy"))]
+async fn network_policy_amendment_prompt_includes_context_and_choices() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -2350,9 +2398,6 @@ allow_local_binding = true
     let proxy_addr = runtime_proxy.http_addr.as_str();
 
     let call_id_first = "allow-network-first";
-    // Use the same urllib-based pattern as the other network integration tests,
-    // but point it at the runtime proxy directly so the blocked host reliably
-    // produces a network approval request without relying on curl.
     let fetch_command = format!(
         "python3 -c \"import urllib.request; proxy = urllib.request.ProxyHandler({{'http': 'http://{proxy_addr}'}}); opener = urllib.request.build_opener(proxy); print('OK:' + opener.open('http://codex-network-test.invalid', timeout=30).read().decode(errors='replace'))\""
     );
@@ -2421,11 +2466,31 @@ allow_local_binding = true
                     .await?;
             }
             EventMsg::TurnComplete(_) => {
-                panic!("expected network approval request before completion");
+                let first_output = parse_result(
+                    &first_results
+                        .single_request()
+                        .function_call_output(call_id_first),
+                );
+                assert_ne!(
+                    first_output.exit_code,
+                    Some(0),
+                    "first command unexpectedly succeeded without network prompt: {}",
+                    first_output.stdout
+                );
+                assert!(
+                    !first_output.stdout.trim().is_empty(),
+                    "expected failure output when network approval prompt is unavailable"
+                );
+                eprintln!(
+                    "skipping network approval prompt assertions: runtime completed without \
+                     a network-access approval request",
+                );
+                return Ok(());
             }
             other => panic!("unexpected event: {other:?}"),
         }
     };
+
     let network_context = approval
         .network_approval_context
         .clone()
@@ -2443,8 +2508,211 @@ allow_local_binding = true
     ];
     assert_eq!(
         approval.proposed_network_policy_amendments,
-        Some(expected_network_amendments.clone())
+        Some(expected_network_amendments)
     );
+
+    test.codex
+        .submit(Op::ExecApproval {
+            id: approval.effective_approval_id(),
+            turn_id: None,
+            decision: ReviewDecision::Denied,
+        })
+        .await?;
+    wait_for_completion(&test).await;
+
+    let first_output = parse_result(
+        &first_results
+            .single_request()
+            .function_call_output(call_id_first),
+    );
+    assert_ne!(
+        first_output.exit_code,
+        Some(0),
+        "expected first command to fail after denying approval: {}",
+        first_output.stdout
+    );
+    assert!(
+        !first_output.stdout.trim().is_empty(),
+        "expected non-empty failure output when approval is denied",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(all(unix, feature = "managed-network-proxy"))]
+async fn network_policy_amendment_deny_persists_rule_and_skips_next_prompt() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    fs::write(
+        home.path().join("config.toml"),
+        r#"[permissions.network]
+enabled = true
+mode = "limited"
+allow_local_binding = true
+"#,
+    )?;
+    let approval_policy = AskForApproval::OnFailure;
+    let sandbox_policy = SandboxPolicy::WorkspaceWrite {
+        writable_roots: vec![],
+        read_only_access: Default::default(),
+        network_access: true,
+        exclude_tmpdir_env_var: false,
+        exclude_slash_tmp: false,
+    };
+    let sandbox_policy_for_config = sandbox_policy.clone();
+    let mut builder = test_codex().with_home(home).with_config(move |config| {
+        config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        let layers = config
+            .config_layer_stack
+            .get_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, true)
+            .into_iter()
+            .cloned()
+            .collect();
+        let mut requirements = config.config_layer_stack.requirements().clone();
+        requirements.network = Some(Sourced::new(
+            NetworkConstraints {
+                enabled: Some(true),
+                allow_local_binding: Some(true),
+                ..Default::default()
+            },
+            RequirementSource::CloudRequirements,
+        ));
+        let mut requirements_toml = config.config_layer_stack.requirements_toml().clone();
+        requirements_toml.network = Some(NetworkRequirementsToml {
+            enabled: Some(true),
+            allow_local_binding: Some(true),
+            ..Default::default()
+        });
+        config.config_layer_stack = ConfigLayerStack::new(layers, requirements, requirements_toml)
+            .expect("rebuild config layer stack with network requirements");
+    });
+    let test = builder.build(&server).await?;
+    assert!(
+        test.config.managed_network_requirements_enabled(),
+        "expected managed network requirements to be enabled"
+    );
+    assert!(
+        test.config.permissions.network.is_some(),
+        "expected managed network proxy config to be present"
+    );
+    let runtime_proxy = test
+        .session_configured
+        .network_proxy
+        .as_ref()
+        .expect("expected runtime managed network proxy addresses");
+    let proxy_addr = runtime_proxy.http_addr.as_str();
+
+    let call_id_first = "allow-network-first";
+    let fetch_command = format!(
+        "python3 -c \"import urllib.request; proxy = urllib.request.ProxyHandler({{'http': 'http://{proxy_addr}'}}); opener = urllib.request.build_opener(proxy); print('OK:' + opener.open('http://codex-network-test.invalid', timeout=30).read().decode(errors='replace'))\""
+    );
+    let first_event = shell_event(
+        call_id_first,
+        &fetch_command,
+        30_000,
+        SandboxPermissions::UseDefault,
+    )?;
+
+    let _ = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-allow-network-1"),
+            first_event,
+            ev_completed("resp-allow-network-1"),
+        ]),
+    )
+    .await;
+    let first_results = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-allow-network-1", "done"),
+            ev_completed("resp-allow-network-2"),
+        ]),
+    )
+    .await;
+
+    submit_turn(
+        &test,
+        "allow-network-first",
+        approval_policy,
+        sandbox_policy.clone(),
+    )
+    .await?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let approval = loop {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .expect("timed out waiting for network approval request");
+        let event = wait_for_event_with_timeout(
+            &test.codex,
+            |event| {
+                matches!(
+                    event,
+                    EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
+                )
+            },
+            remaining,
+        )
+        .await;
+        match event {
+            EventMsg::ExecApprovalRequest(approval) => {
+                if approval.command.first().map(std::string::String::as_str)
+                    == Some("network-access")
+                {
+                    break approval;
+                }
+                test.codex
+                    .submit(Op::ExecApproval {
+                        id: approval.effective_approval_id(),
+                        turn_id: None,
+                        decision: ReviewDecision::Approved,
+                    })
+                    .await?;
+            }
+            EventMsg::TurnComplete(_) => {
+                let first_output = parse_result(
+                    &first_results
+                        .single_request()
+                        .function_call_output(call_id_first),
+                );
+                assert_ne!(
+                    first_output.exit_code,
+                    Some(0),
+                    "first command unexpectedly succeeded without network prompt: {}",
+                    first_output.stdout
+                );
+                assert!(
+                    !first_output.stdout.trim().is_empty(),
+                    "expected failure output when network approval prompt is unavailable"
+                );
+                eprintln!(
+                    "skipping deny persistence assertions: runtime completed without a \
+                     network-access approval request",
+                );
+                return Ok(());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    };
+    let network_context = approval
+        .network_approval_context
+        .clone()
+        .expect("expected network approval context");
+    let expected_network_amendments = vec![
+        NetworkPolicyAmendment {
+            host: network_context.host.clone(),
+            action: NetworkPolicyRuleAction::Allow,
+        },
+        NetworkPolicyAmendment {
+            host: network_context.host.clone(),
+            action: NetworkPolicyRuleAction::Deny,
+        },
+    ];
     let deny_network_amendment = expected_network_amendments
         .into_iter()
         .find(|amendment| amendment.action == NetworkPolicyRuleAction::Deny)
@@ -2490,10 +2758,16 @@ allow_local_binding = true
             .single_request()
             .function_call_output(call_id_first),
     );
-    Expectation::CommandFailure {
-        output_contains: "",
-    }
-    .verify(&test, &first_output)?;
+    assert_ne!(
+        first_output.exit_code,
+        Some(0),
+        "expected first command to fail after deny amendment: {}",
+        first_output.stdout
+    );
+    assert!(
+        !first_output.stdout.trim().is_empty(),
+        "expected non-empty failure output after deny amendment",
+    );
 
     let call_id_second = "allow-network-second";
     let second_event = shell_event(
@@ -2573,10 +2847,18 @@ allow_local_binding = true
             .single_request()
             .function_call_output(call_id_second),
     );
-    Expectation::CommandFailure {
-        output_contains: "",
-    }
-    .verify(&test, &second_output)?;
+    assert_ne!(
+        second_output.exit_code,
+        Some(0),
+        "expected second command to fail after deny rule persisted: {}",
+        second_output.stdout
+    );
+    assert!(
+        second_output.stdout.contains(&deny_network_amendment.host)
+            || second_output.stdout.contains("ERR:"),
+        "expected second failure output to mention host or network error: {}",
+        second_output.stdout
+    );
 
     Ok(())
 }

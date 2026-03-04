@@ -2014,7 +2014,24 @@ impl Config {
             .or(cfg.model_instructions_file.as_ref());
         let file_base_instructions =
             Self::try_read_non_empty_file(model_instructions_path, "model instructions file")?;
-        let base_instructions = base_instructions.or(file_base_instructions);
+        let base_instructions = match file_base_instructions {
+            Some(file_base_instructions) => {
+                if base_instructions.is_some() {
+                    let path = model_instructions_path
+                        .map(|path| path.as_path().display().to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    tracing::warn!(
+                        model_instructions_file = %path,
+                        "Ignoring runtime base_instructions override because model_instructions_file is configured."
+                    );
+                    startup_warnings.push(format!(
+                        "Ignoring runtime `base_instructions` override because `model_instructions_file` is configured: {path}"
+                    ));
+                }
+                Some(file_base_instructions)
+            }
+            None => base_instructions,
+        };
         let developer_instructions = developer_instructions.or(cfg.developer_instructions);
         let personality = personality
             .or(config_profile.personality)
@@ -4765,6 +4782,74 @@ model = "gpt-5.1-codex"
         assert_eq!(
             config.compact_prompt.as_deref(),
             Some("summarize differently")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_base_instructions_apply_when_model_instructions_file_is_unset() -> std::io::Result<()>
+    {
+        let codex_home = TempDir::new()?;
+        let workspace = codex_home.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides {
+                cwd: Some(workspace),
+                base_instructions: Some("runtime override".to_string()),
+                ..Default::default()
+            },
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(
+            config.base_instructions.as_deref(),
+            Some("runtime override")
+        );
+        assert!(
+            !config.startup_warnings.iter().any(|warning| warning.contains(
+                "Ignoring runtime `base_instructions` override because `model_instructions_file` is configured"
+            )),
+            "{:?}",
+            config.startup_warnings
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn model_instructions_file_overrides_runtime_base_instructions() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let workspace = codex_home.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+
+        let instructions_path = workspace.join("instructions.md");
+        std::fs::write(&instructions_path, "file override")?;
+
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                model_instructions_file: Some(AbsolutePathBuf::from_absolute_path(
+                    instructions_path.clone(),
+                )?),
+                ..Default::default()
+            },
+            ConfigOverrides {
+                cwd: Some(workspace),
+                base_instructions: Some("runtime override".to_string()),
+                ..Default::default()
+            },
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(config.base_instructions.as_deref(), Some("file override"));
+        assert!(
+            config.startup_warnings.iter().any(|warning| warning.contains(
+                "Ignoring runtime `base_instructions` override because `model_instructions_file` is configured"
+            )),
+            "{:?}",
+            config.startup_warnings
         );
 
         Ok(())

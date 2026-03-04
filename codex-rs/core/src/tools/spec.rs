@@ -998,10 +998,19 @@ fn create_wait_tool() -> ToolSpec {
             )),
         },
     );
+    properties.insert(
+        "dependency_reason".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Required only when immediately waiting on a freshly spawned awaiter because no other work can proceed."
+                    .to_string(),
+            ),
+        },
+    );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "wait".to_string(),
-        description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Once the agent reaches a final status, a notification message will be received containing the same completed status."
+        description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Once the agent reaches a final status, a notification message will be received containing the same completed status. Do not immediately wait on a freshly spawned awaiter unless you provide dependency_reason."
             .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
@@ -2286,6 +2295,20 @@ mod tests {
         });
         let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         assert_contains_tool_names(&tools, &["presentation_artifact", "spreadsheet_artifact"]);
+    }
+
+    #[test]
+    fn wait_tool_exposes_dependency_reason_parameter() {
+        let ToolSpec::Function(ResponsesApiTool { parameters, .. }) = create_wait_tool() else {
+            panic!("wait tool should be a function");
+        };
+        let JsonSchema::Object { properties, .. } = parameters else {
+            panic!("wait tool parameters should be an object schema");
+        };
+        assert!(
+            properties.contains_key("dependency_reason"),
+            "wait tool should expose dependency_reason"
+        );
     }
 
     #[test]

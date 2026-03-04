@@ -41,6 +41,9 @@ use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 
 /// Function-tool handler for the multi-agent collaboration API.
 pub struct MultiAgentHandler;
@@ -49,6 +52,10 @@ pub struct MultiAgentHandler;
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = 3600 * 1000;
+const AWAITER_ROLE_NAME: &str = "awaiter";
+
+static FRESH_AWAITER_IDS_BY_TURN: LazyLock<Mutex<HashMap<String, HashSet<ThreadId>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Deserialize)]
 struct CloseAgentArgs {
@@ -93,6 +100,41 @@ impl ToolHandler for MultiAgentHandler {
             other => Err(FunctionCallError::RespondToModel(format!(
                 "unsupported collab tool {other}"
             ))),
+        }
+    }
+}
+
+fn record_fresh_awaiter(turn_id: &str, thread_id: ThreadId) {
+    if let Ok(mut by_turn) = FRESH_AWAITER_IDS_BY_TURN.lock() {
+        by_turn
+            .entry(turn_id.to_string())
+            .or_default()
+            .insert(thread_id);
+    }
+}
+
+fn fresh_awaiter_wait_ids(turn_id: &str, ids: &[ThreadId]) -> Vec<ThreadId> {
+    let Ok(by_turn) = FRESH_AWAITER_IDS_BY_TURN.lock() else {
+        return Vec::new();
+    };
+    let Some(fresh_ids) = by_turn.get(turn_id) else {
+        return Vec::new();
+    };
+    ids.iter()
+        .copied()
+        .filter(|id| fresh_ids.contains(id))
+        .collect()
+}
+
+fn clear_fresh_awaiter_ids(turn_id: &str, ids: &[ThreadId]) {
+    if let Ok(mut by_turn) = FRESH_AWAITER_IDS_BY_TURN.lock()
+        && let Some(fresh_ids) = by_turn.get_mut(turn_id)
+    {
+        for id in ids {
+            fresh_ids.remove(id);
+        }
+        if fresh_ids.is_empty() {
+            by_turn.remove(turn_id);
         }
     }
 }
@@ -214,6 +256,9 @@ mod spawn {
             .await;
         let new_thread_id = result?;
         let role_tag = role_name.unwrap_or(DEFAULT_ROLE_NAME);
+        if role_tag == AWAITER_ROLE_NAME {
+            record_fresh_awaiter(&turn.sub_id, new_thread_id);
+        }
         turn.otel_manager
             .counter("codex.multi_agent.spawn", 1, &[("role", role_tag)]);
 
@@ -482,6 +527,7 @@ pub(crate) mod wait {
     struct WaitArgs {
         ids: Vec<String>,
         timeout_ms: Option<i64>,
+        dependency_reason: Option<String>,
     }
 
     #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -508,6 +554,7 @@ pub(crate) mod wait {
             .map(|id| agent_id(id))
             .collect::<Result<Vec<_>, _>>()?;
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
+        let mut awaiter_wait_ids = Vec::new();
         for receiver_thread_id in &receiver_thread_ids {
             let (agent_nickname, agent_role) = session
                 .services
@@ -515,11 +562,29 @@ pub(crate) mod wait {
                 .get_agent_nickname_and_role(*receiver_thread_id)
                 .await
                 .unwrap_or((None, None));
+            if agent_role.as_deref() == Some(AWAITER_ROLE_NAME) {
+                awaiter_wait_ids.push(*receiver_thread_id);
+            }
             receiver_agents.push(CollabAgentRef {
                 thread_id: *receiver_thread_id,
                 agent_nickname,
                 agent_role,
             });
+        }
+        let fresh_awaiter_ids = fresh_awaiter_wait_ids(&turn.sub_id, &awaiter_wait_ids);
+        if !fresh_awaiter_ids.is_empty() {
+            let dependency_reason = args
+                .dependency_reason
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default();
+            if dependency_reason.is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "Immediate wait on a freshly spawned awaiter requires dependency_reason. Continue independent work first, or retry wait with a concrete dependency reason."
+                        .to_string(),
+                ));
+            }
+            clear_fresh_awaiter_ids(&turn.sub_id, &fresh_awaiter_ids);
         }
 
         // Validate timeout.
@@ -1746,6 +1811,213 @@ mod tests {
                 "Agent depth limit reached. Solve the task yourself.".to_string()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn wait_requires_dependency_reason_for_fresh_awaiter() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+
+        let spawn_invocation = invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "monitor tests",
+                "agent_type": "awaiter"
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(spawn_invocation)
+            .await
+            .expect("spawn awaiter should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: serde_json::Value =
+            serde_json::from_str(&content).expect("spawn result should be json");
+        let agent_id = result
+            .get("agent_id")
+            .and_then(|value| value.as_str())
+            .expect("spawn result should contain agent_id");
+        let agent_id = ThreadId::from_string(agent_id).expect("agent id should parse");
+
+        let wait_invocation = invocation(
+            session.clone(),
+            turn.clone(),
+            "wait",
+            function_payload(json!({
+                "ids": [agent_id.to_string()],
+                "timeout_ms": 1000
+            })),
+        );
+        let Err(err) = MultiAgentHandler.handle(wait_invocation).await else {
+            panic!("wait should require dependency reason for a fresh awaiter");
+        };
+        manager
+            .agent_control()
+            .shutdown_agent(agent_id)
+            .await
+            .expect("shutdown awaiter");
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "Immediate wait on a freshly spawned awaiter requires dependency_reason. Continue independent work first, or retry wait with a concrete dependency reason."
+                    .to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_allows_dependency_reason_for_fresh_awaiter() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+
+        let spawn_invocation = invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "monitor tests",
+                "agent_type": "awaiter"
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(spawn_invocation)
+            .await
+            .expect("spawn awaiter should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: serde_json::Value =
+            serde_json::from_str(&content).expect("spawn result should be json");
+        let agent_id = result
+            .get("agent_id")
+            .and_then(|value| value.as_str())
+            .expect("spawn result should contain agent_id");
+        let agent_id = ThreadId::from_string(agent_id).expect("agent id should parse");
+        manager
+            .agent_control()
+            .shutdown_agent(agent_id)
+            .await
+            .expect("shutdown awaiter");
+
+        let wait_invocation = invocation(
+            session.clone(),
+            turn.clone(),
+            "wait",
+            function_payload(json!({
+                "ids": [agent_id.to_string()],
+                "timeout_ms": 1000,
+                "dependency_reason": "Need final test result before applying patch."
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(wait_invocation)
+            .await
+            .expect("wait should succeed with dependency reason");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: wait::WaitResult =
+            serde_json::from_str(&content).expect("wait result should be json");
+        assert!(!result.timed_out);
+        assert!(matches!(
+            result.status.get(&agent_id),
+            Some(AgentStatus::Shutdown | AgentStatus::NotFound)
+        ));
+        assert_eq!(success, None);
+    }
+
+    #[tokio::test]
+    async fn wait_does_not_require_dependency_reason_for_non_awaiter() {
+        let (mut session, turn) = make_session_and_context().await;
+        let manager = thread_manager();
+        session.services.agent_control = manager.agent_control();
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+
+        let spawn_invocation = invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "do work",
+                "agent_type": "worker"
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(spawn_invocation)
+            .await
+            .expect("spawn worker should succeed");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: serde_json::Value =
+            serde_json::from_str(&content).expect("spawn result should be json");
+        let agent_id = result
+            .get("agent_id")
+            .and_then(|value| value.as_str())
+            .expect("spawn result should contain agent_id");
+        let agent_id = ThreadId::from_string(agent_id).expect("agent id should parse");
+        manager
+            .agent_control()
+            .shutdown_agent(agent_id)
+            .await
+            .expect("shutdown worker");
+
+        let wait_invocation = invocation(
+            session.clone(),
+            turn.clone(),
+            "wait",
+            function_payload(json!({
+                "ids": [agent_id.to_string()],
+                "timeout_ms": 1000
+            })),
+        );
+        let output = MultiAgentHandler
+            .handle(wait_invocation)
+            .await
+            .expect("wait should succeed without dependency reason for worker");
+        let ToolOutput::Function {
+            body: FunctionCallOutputBody::Text(content),
+            success,
+            ..
+        } = output
+        else {
+            panic!("expected function output");
+        };
+        let result: wait::WaitResult =
+            serde_json::from_str(&content).expect("wait result should be json");
+        assert!(!result.timed_out);
+        assert!(matches!(
+            result.status.get(&agent_id),
+            Some(AgentStatus::Shutdown | AgentStatus::NotFound)
+        ));
+        assert_eq!(success, None);
     }
 
     #[tokio::test]

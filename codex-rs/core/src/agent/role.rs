@@ -232,24 +232,24 @@ Rules:
                         nickname_candidates: None,
                     }
                 ),
-                // Awaiter is temp removed
-//                 (
-//                     "awaiter".to_string(),
-//                     AgentRoleConfig {
-//                         description: Some(r#"Use an `awaiter` agent EVERY TIME you must run a command that will take some very long time.
-// This includes, but not only:
-// * testing
-// * monitoring of a long running process
-// * explicit ask to wait for something
-//
-// Rules:
-// - When an awaiter is running, you can work on something else. If you need to wait for its completion, use the largest possible timeout.
-// - Be patient with the `awaiter`.
-// - Do not use an awaiter for every compilation/test if it won't take time. Only use if for long running commands.
-// - Close the awaiter when you're done with it."#.to_string()),
-//                         config_file: Some("awaiter.toml".to_string().parse().unwrap_or_default()),
-//                     }
-//                 )
+                (
+                    "awaiter".to_string(),
+                    AgentRoleConfig {
+                        description: Some(r#"Use an `awaiter` agent when long-running work can proceed in parallel with other useful tasks.
+Typical uses:
+* testing that may take a while
+* monitoring a long running process
+* explicit ask to wait for something
+
+Rules:
+- Preferred flow: spawn awaiter -> do independent work -> wait at the dependency boundary.
+- Do not spawn an awaiter and immediately wait unless you are blocked by a concrete dependency.
+- If you must immediately wait on a freshly spawned awaiter, provide a clear dependency reason in the wait call.
+- Use long wait timeouts to avoid busy polling.
+- Close the awaiter when you're done with it."#.to_string()),
+                        config_file: Some("awaiter.toml".to_string().parse().unwrap_or_default()),
+                    }
+                )
             ])
         });
         &CONFIG

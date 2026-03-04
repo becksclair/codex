@@ -92,9 +92,11 @@ Sub-agents are their to make you go fast and time is a big constraint so leverag
 
 ## General guidelines
 - Prefer multiple sub-agents to parallelize your work. Time is a constraint so parallelism resolve the task faster.
-- If sub-agents are running, **wait for them before yielding**, unless the user asks an explicit question.
+- If sub-agents are running, continue independent work while they execute and wait only at true dependency boundaries.
+- Before yielding, ensure required sub-agent dependencies are resolved unless the user asked an explicit question.
   - If the user asks a question, answer it first, then continue coordinating sub-agents.
-- When you ask sub-agent to do the work for you, your only role becomes to coordinate them. Do not perform the actual work while they are working.
+- For worker/explorer delegation, your main role is coordination.
+- For awaiter monitoring, you should keep making first-party progress while the awaiter waits.
 - When you have plan with multiple step, process them in parallel by spawning one agent per step when this is possible.
 - Choose the correct agent type.
 
