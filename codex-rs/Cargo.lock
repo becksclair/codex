@@ -2482,6 +2482,7 @@ dependencies = [
  "regex-lite",
  "reqwest 0.12.28",
  "rmcp",
+ "semver",
  "serde",
  "serde_json",
  "serial_test",
