@@ -13,6 +13,7 @@ use crate::exec::StdoutStream;
 use crate::exec::execute_exec_env;
 use crate::landlock::allow_network_for_proxy;
 use crate::landlock::create_linux_sandbox_command_args;
+use crate::network_proxy::NetworkProxy;
 use crate::protocol::SandboxPolicy;
 #[cfg(target_os = "macos")]
 use crate::seatbelt::MACOS_PATH_TO_SEATBELT_EXECUTABLE;
@@ -22,7 +23,6 @@ use crate::seatbelt::create_seatbelt_command_args_with_extensions;
 use crate::spawn::CODEX_SANDBOX_ENV_VAR;
 use crate::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR;
 use crate::tools::sandboxing::SandboxablePreference;
-use codex_network_proxy::NetworkProxy;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::FileSystemPermissions;
 #[cfg(target_os = "macos")]
@@ -91,8 +91,6 @@ pub enum SandboxPreference {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SandboxTransformError {
-    #[error("missing codex-linux-sandbox executable path")]
-    MissingLinuxSandboxExecutable,
     #[cfg(not(target_os = "macos"))]
     #[error("seatbelt sandbox is only available on macOS")]
     SeatbeltUnavailable,
@@ -366,8 +364,24 @@ impl SandboxManager {
             #[cfg(not(target_os = "macos"))]
             SandboxType::MacosSeatbelt => return Err(SandboxTransformError::SeatbeltUnavailable),
             SandboxType::LinuxSeccomp => {
-                let exe = codex_linux_sandbox_exe
-                    .ok_or(SandboxTransformError::MissingLinuxSandboxExecutable)?;
+                let Some(exe) = codex_linux_sandbox_exe else {
+                    tracing::warn!(
+                        "linux sandbox requested but codex-linux-sandbox is unavailable; running command without sandbox"
+                    );
+                    return Ok(ExecRequest {
+                        command,
+                        cwd: spec.cwd,
+                        env,
+                        network: network.cloned(),
+                        expiration: spec.expiration,
+                        sandbox: SandboxType::None,
+                        windows_sandbox_level,
+                        sandbox_permissions: spec.sandbox_permissions,
+                        sandbox_policy: effective_policy,
+                        justification: spec.justification,
+                        arg0: None,
+                    });
+                };
                 let allow_proxy_network = allow_network_for_proxy(enforce_managed_network);
                 let mut args = create_linux_sandbox_command_args(
                     command.clone(),
@@ -427,12 +441,18 @@ pub async fn execute_env(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use super::CommandSpec;
     use super::SandboxManager;
+    use super::SandboxTransformRequest;
     use super::normalize_additional_permissions;
     use super::sandbox_policy_with_additional_permissions;
+    use crate::exec::ExecExpiration;
     use crate::exec::SandboxType;
     use crate::protocol::ReadOnlyAccess;
     use crate::protocol::SandboxPolicy;
+    use crate::sandboxing::SandboxPermissions;
     use crate::tools::sandboxing::SandboxablePreference;
     use codex_protocol::config_types::WindowsSandboxLevel;
     use codex_protocol::models::FileSystemPermissions;
@@ -539,6 +559,40 @@ mod tests {
                 },
                 network_access: true,
             }
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn transform_falls_back_to_unsandboxed_when_linux_sandbox_executable_missing() {
+        let manager = SandboxManager::new();
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let request = SandboxTransformRequest {
+            spec: CommandSpec {
+                program: "echo".to_string(),
+                args: vec!["hello".to_string()],
+                cwd: temp_dir.path().to_path_buf(),
+                env: HashMap::new(),
+                expiration: ExecExpiration::DefaultTimeout,
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                additional_permissions: None,
+                justification: None,
+            },
+            policy: &SandboxPolicy::new_read_only_policy(),
+            sandbox: SandboxType::LinuxSeccomp,
+            enforce_managed_network: false,
+            network: None,
+            sandbox_policy_cwd: temp_dir.path(),
+            codex_linux_sandbox_exe: None,
+            use_linux_sandbox_bwrap: false,
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        };
+
+        let exec_request = manager.transform(request).expect("transform request");
+        assert_eq!(exec_request.sandbox, SandboxType::None);
+        assert_eq!(
+            exec_request.command,
+            vec!["echo".to_string(), "hello".to_string()]
         );
     }
 }

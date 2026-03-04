@@ -16,6 +16,10 @@ path = "src/bin/config_schema.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+managed-network-proxy = ["dep:codex-network-proxy"]
+
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = "1.8.2"
@@ -40,7 +44,7 @@ codex-file-search = { workspace = true }
 codex-git = { workspace = true }
 codex-hooks = { workspace = true }
 codex-keyring-store = { workspace = true }
-codex-network-proxy = { workspace = true }
+codex-network-proxy = { workspace = true, optional = true }
 codex-otel = { workspace = true }
 codex-artifact-presentation = { workspace = true }
 codex-artifact-spreadsheet = { workspace = true }

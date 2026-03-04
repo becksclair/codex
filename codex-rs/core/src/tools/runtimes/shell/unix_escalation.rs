@@ -631,7 +631,7 @@ struct CoreShellCommandExecutor {
     sandbox_policy: SandboxPolicy,
     sandbox: SandboxType,
     env: HashMap<String, String>,
-    network: Option<codex_network_proxy::NetworkProxy>,
+    network: Option<crate::network_proxy::NetworkProxy>,
     windows_sandbox_level: WindowsSandboxLevel,
     sandbox_permissions: SandboxPermissions,
     justification: Option<String>,

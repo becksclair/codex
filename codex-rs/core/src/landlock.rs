@@ -1,8 +1,8 @@
+use crate::network_proxy::NetworkProxy;
 use crate::protocol::SandboxPolicy;
 use crate::spawn::SpawnChildRequest;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
-use codex_network_proxy::NetworkProxy;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;

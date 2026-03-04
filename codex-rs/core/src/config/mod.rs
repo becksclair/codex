@@ -99,10 +99,10 @@ pub mod profile;
 pub mod schema;
 pub mod service;
 pub mod types;
+pub use crate::network_proxy::NetworkProxyAuditMetadata;
 pub use codex_config::Constrained;
 pub use codex_config::ConstraintError;
 pub use codex_config::ConstraintResult;
-pub use codex_network_proxy::NetworkProxyAuditMetadata;
 
 pub use managed_features::ManagedFeatures;
 pub use network_proxy_spec::NetworkProxySpec;
@@ -2105,6 +2105,34 @@ impl Config {
             None => (None, None),
         };
         let has_network_requirements = network_requirements.is_some();
+        #[cfg(not(feature = "managed-network-proxy"))]
+        {
+            if cfg
+                .permissions
+                .as_ref()
+                .and_then(|permissions| permissions.network.as_ref())
+                .is_some()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "this build disables managed network proxy support; remove [permissions.network] or run with `--features codex-core/managed-network-proxy`",
+                ));
+            }
+            if has_network_requirements {
+                let message = if let Some(source) = network_requirements_source.as_ref() {
+                    format!(
+                        "managed network requirements from {source} are not supported in this build; run with `--features codex-core/managed-network-proxy`"
+                    )
+                } else {
+                    "managed network requirements are not supported in this build; run with `--features codex-core/managed-network-proxy`"
+                        .to_string()
+                };
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    message,
+                ));
+            }
+        }
         let network = NetworkProxySpec::from_config_and_constraints(
             configured_network_proxy_config,
             network_requirements,
@@ -2734,6 +2762,7 @@ allowed_domains = ["openai.com"]
         );
     }
 
+    #[cfg(feature = "managed-network-proxy")]
     #[test]
     fn permissions_network_enabled_populates_runtime_network_proxy_spec() -> std::io::Result<()> {
         let codex_home = TempDir::new()?;
@@ -2765,6 +2794,7 @@ allowed_domains = ["openai.com"]
         Ok(())
     }
 
+    #[cfg(feature = "managed-network-proxy")]
     #[test]
     fn permissions_network_disabled_by_default_does_not_start_proxy() -> std::io::Result<()> {
         let codex_home = TempDir::new()?;
@@ -2784,6 +2814,35 @@ allowed_domains = ["openai.com"]
             codex_home.path().to_path_buf(),
         )?;
         assert!(config.permissions.network.is_none());
+        Ok(())
+    }
+
+    #[cfg(not(feature = "managed-network-proxy"))]
+    #[test]
+    fn permissions_network_is_rejected_when_managed_network_proxy_feature_is_disabled()
+    -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            permissions: Some(PermissionsToml {
+                network: Some(NetworkToml {
+                    enabled: Some(true),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+
+        let err = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect_err("permissions.network should be rejected without managed proxy feature");
+        assert!(
+            err.to_string()
+                .contains("disables managed network proxy support"),
+            "unexpected error: {err}"
+        );
         Ok(())
     }
 

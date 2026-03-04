@@ -10,6 +10,10 @@ alias c := codex
 codex *args:
     cargo run --bin codex -- "$@"
 
+# `codex` with managed network proxy support enabled.
+codex-with-proxy *args:
+    cargo run --bin codex --features codex-core/managed-network-proxy -- "$@"
+
 # `codex exec`
 exec *args:
     cargo run --bin codex -- exec "$@"
@@ -34,8 +38,31 @@ clippy:
     cargo clippy --tests "$@"
 
 install:
+    just write-config-schema
     rustup show active-toolchain
-    cargo fetch
+    cargo build -p codex-cli --release
+    install -Dm755 target/release/codex "${HOME}/.cargo/bin/codex"
+    "${HOME}/.cargo/bin/codex" --version
+
+# Build and install Codex on Windows.
+install-windows:
+    just write-config-schema
+    rustup show active-toolchain
+    cargo build -p codex-cli --release
+    powershell -NoProfile -Command "$dest = Join-Path $env:USERPROFILE '.local\\bin'; New-Item -ItemType Directory -Force -Path $dest | Out-Null; Copy-Item -Force 'target/release/codex.exe' (Join-Path $dest 'codex.exe')"
+    powershell -NoProfile -Command "& (Join-Path $env:USERPROFILE '.local\\bin\\codex.exe') --version"
+
+# Build codex-cli for linux/arm64 gnu in a container and deploy to a remote host.
+# Defaults to a release build; pass --debug to force a dev profile build.
+deploy-linux-arm64-gnu *args:
+    just write-config-schema
+    bash ../scripts/build_deploy_linux_arm64_gnu.sh "$@"
+
+# Build and deploy an optimized (release) linux/arm64 gnu binary.
+# Kept as a convenience wrapper while release is now the default mode.
+deploy-linux-arm64-gnu-release *args:
+    just write-config-schema
+    bash ../scripts/build_deploy_linux_arm64_gnu.sh --release "$@"
 
 # Run `cargo nextest` since it's faster than `cargo test`, though including
 # --no-fail-fast is important to ensure all tests are run.
@@ -46,6 +73,10 @@ install:
 test:
     cargo nextest run --no-fail-fast
 
+# Run tests with managed network proxy support enabled, including all workspace members.
+test-with-proxy:
+    cargo nextest run --workspace --no-fail-fast --features codex-core/managed-network-proxy
+
 # Build and run Codex from source using Bazel.
 # Note we have to use the combination of `[no-cd]` and `--run_under="cd $PWD &&"`
 # to ensure that Bazel runs the command in the current working directory.
@@ -55,11 +86,11 @@ bazel-codex *args:
 
 [no-cd]
 bazel-lock-update:
-    bazel mod deps --lockfile_mode=update
+    cd {{ justfile_directory() }} && bazel mod deps --lockfile_mode=update
 
 [no-cd]
 bazel-lock-check:
-    ./scripts/check-module-bazel-lock.sh
+    cd {{ justfile_directory() }} && bash ./scripts/check-module-bazel-lock.sh
 
 bazel-test:
     bazel test //... --keep_going
@@ -68,6 +99,7 @@ bazel-remote-test:
     bazel test //... --config=remote --platforms=//:rbe --keep_going
 
 build-for-release:
+    just write-config-schema
     bazel build //codex-rs/cli:release_binaries --config=remote
 
 # Run the MCP server

@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 use std::time::Duration;
 
-use codex_network_proxy::NetworkProxy;
+use crate::network_proxy::NetworkProxy;
 use codex_protocol::models::PermissionProfile;
 use rand::Rng;
 use rand::rng;

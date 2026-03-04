@@ -20,6 +20,7 @@ use crate::error::CodexErr;
 use crate::error::Result;
 use crate::error::SandboxErr;
 use crate::get_platform_sandbox;
+use crate::network_proxy::NetworkProxy;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecCommandOutputDeltaEvent;
@@ -33,7 +34,6 @@ use crate::spawn::SpawnChildRequest;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
 use crate::text_encoding::bytes_to_string_smart;
-use codex_network_proxy::NetworkProxy;
 use codex_utils_pty::process_group::kill_child_process_group;
 
 pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
@@ -514,9 +514,6 @@ pub(crate) mod errors {
     impl From<SandboxTransformError> for CodexErr {
         fn from(err: SandboxTransformError) -> Self {
             match err {
-                SandboxTransformError::MissingLinuxSandboxExecutable => {
-                    CodexErr::LandlockSandboxExecutableNotProvided
-                }
                 #[cfg(not(target_os = "macos"))]
                 SandboxTransformError::SeatbeltUnavailable => CodexErr::UnsupportedOperation(
                     "seatbelt sandbox is only available on macOS".to_string(),

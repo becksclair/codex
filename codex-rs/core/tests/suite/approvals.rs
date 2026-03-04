@@ -22,6 +22,8 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
+#[cfg(target_os = "linux")]
+use codex_utils_cargo_bin::cargo_bin;
 use core_test_support::responses::ev_apply_patch_function_call;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -526,6 +528,48 @@ struct ScenarioSpec {
     model_override: Option<&'static str>,
     outcome: Outcome,
     expectation: Expectation,
+}
+
+impl ScenarioSpec {
+    fn requires_sandbox_enforcement(&self) -> bool {
+        let expectation_requires_sandbox = match &self.expectation {
+            Expectation::NetworkFailure { .. } => true,
+            Expectation::FileNotCreated {
+                message_contains, ..
+            } => message_contains.iter().any(|needle| {
+                needle.contains("Permission denied")
+                    || needle.contains("Operation not permitted")
+                    || needle.contains("operation not permitted")
+                    || needle.contains("Read-only file system")
+            }),
+            _ => false,
+        };
+
+        let outcome_requires_sandbox = match &self.outcome {
+            Outcome::ExecApproval {
+                expected_reason: Some(reason),
+                ..
+            }
+            | Outcome::PatchApproval {
+                expected_reason: Some(reason),
+                ..
+            } => reason.contains("retry without sandbox"),
+            _ => false,
+        };
+
+        expectation_requires_sandbox || outcome_requires_sandbox
+    }
+}
+
+fn platform_sandbox_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        cargo_bin("codex-linux-sandbox").is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
 }
 
 struct CommandResult {
@@ -1577,8 +1621,21 @@ fn scenarios() -> Vec<ScenarioSpec> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approval_matrix_covers_all_modes() -> Result<()> {
     skip_if_no_network!(Ok(()));
+    let sandbox_available = platform_sandbox_available();
+    if !sandbox_available {
+        eprintln!(
+            "skipping sandbox-enforcement approval scenarios: codex-linux-sandbox executable unavailable"
+        );
+    }
 
     for scenario in scenarios() {
+        if !sandbox_available && scenario.requires_sandbox_enforcement() {
+            eprintln!(
+                "skipping approval scenario that requires sandbox enforcement: {}",
+                scenario.name
+            );
+            continue;
+        }
         run_scenario(&scenario).await?;
     }
 

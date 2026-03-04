@@ -1,9 +1,9 @@
 #![cfg(target_os = "macos")]
 
-use codex_network_proxy::NetworkProxy;
-use codex_network_proxy::PROXY_URL_ENV_KEYS;
-use codex_network_proxy::has_proxy_url_env_vars;
-use codex_network_proxy::proxy_url_env_value;
+use crate::network_proxy::NetworkProxy;
+use crate::network_proxy::PROXY_URL_ENV_KEYS;
+use crate::network_proxy::has_proxy_url_env_vars;
+use crate::network_proxy::proxy_url_env_value;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

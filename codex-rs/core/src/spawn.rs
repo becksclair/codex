@@ -1,4 +1,4 @@
-use codex_network_proxy::NetworkProxy;
+use crate::network_proxy::NetworkProxy;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;

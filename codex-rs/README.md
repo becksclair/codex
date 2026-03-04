@@ -89,6 +89,17 @@ codex --sandbox danger-full-access
 
 The same setting can be persisted in `~/.codex/config.toml` via the top-level `sandbox_mode = "MODE"` key, e.g. `sandbox_mode = "workspace-write"`.
 
+### Managed network proxy feature toggle
+
+Some forks keep managed network proxy support disabled by default for faster local iteration.
+When disabled, `[permissions.network]` config is rejected at startup.
+
+To opt in explicitly for a run:
+
+```shell
+cargo run --bin codex --features codex-core/managed-network-proxy -- ...
+```
+
 ## Code Organization
 
 This folder is the root of a Cargo workspace. It contains quite a bit of experimental code, but here are the key crates:

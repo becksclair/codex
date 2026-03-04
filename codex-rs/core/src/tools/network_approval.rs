@@ -1,13 +1,13 @@
 use crate::codex::Session;
 use crate::network_policy_decision::denied_network_policy_message;
+use crate::network_proxy::BlockedRequest;
+use crate::network_proxy::BlockedRequestObserver;
+use crate::network_proxy::NetworkDecision;
+use crate::network_proxy::NetworkPolicyDecider;
+use crate::network_proxy::NetworkPolicyRequest;
+use crate::network_proxy::NetworkProtocol;
+use crate::network_proxy::NetworkProxy;
 use crate::tools::sandboxing::ToolError;
-use codex_network_proxy::BlockedRequest;
-use codex_network_proxy::BlockedRequestObserver;
-use codex_network_proxy::NetworkDecision;
-use codex_network_proxy::NetworkPolicyDecider;
-use codex_network_proxy::NetworkPolicyRequest;
-use codex_network_proxy::NetworkProtocol;
-use codex_network_proxy::NetworkProxy;
 use codex_protocol::approvals::NetworkApprovalContext;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::approvals::NetworkPolicyRuleAction;
@@ -555,7 +555,7 @@ pub(crate) async fn finish_deferred_network_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_network_proxy::BlockedRequestArgs;
+    use crate::network_proxy::BlockedRequestArgs;
     use codex_protocol::protocol::AskForApproval;
     use pretty_assertions::assert_eq;
 

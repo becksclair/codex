@@ -1,5 +1,5 @@
-use codex_network_proxy::NetworkMode;
-use codex_network_proxy::NetworkProxyConfig;
+use crate::network_proxy::NetworkMode;
+use crate::network_proxy::NetworkProxyConfig;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;

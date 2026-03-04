@@ -32,6 +32,9 @@ use crate::features::maybe_push_unstable_features_warning;
 #[cfg(test)]
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
+use crate::network_proxy::NetworkProxy;
+use crate::network_proxy::NetworkProxyAuditMetadata;
+use crate::network_proxy::normalize_host;
 use crate::parse_command::parse_command;
 use crate::parse_turn_item;
 use crate::realtime_conversation::RealtimeConversationManager;
@@ -992,8 +995,8 @@ impl Session {
     async fn start_managed_network_proxy(
         spec: &crate::config::NetworkProxySpec,
         sandbox_policy: &SandboxPolicy,
-        network_policy_decider: Option<Arc<dyn codex_network_proxy::NetworkPolicyDecider>>,
-        blocked_request_observer: Option<Arc<dyn codex_network_proxy::BlockedRequestObserver>>,
+        network_policy_decider: Option<Arc<dyn crate::network_proxy::NetworkPolicyDecider>>,
+        blocked_request_observer: Option<Arc<dyn crate::network_proxy::BlockedRequestObserver>>,
         managed_network_requirements_enabled: bool,
         audit_metadata: NetworkProxyAuditMetadata,
     ) -> anyhow::Result<(StartedNetworkProxy, SessionNetworkProxyRuntime)> {
