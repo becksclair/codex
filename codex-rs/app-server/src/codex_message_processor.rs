@@ -26,8 +26,6 @@ use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::AppsListResponse;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::AuthMode;
-use codex_app_server_protocol::AuthStatusChangeNotification;
-use codex_app_server_protocol::AuthStatusChangeNotification;
 use codex_app_server_protocol::AutoReviewStartParams;
 use codex_app_server_protocol::AutoReviewStartResponse;
 use codex_app_server_protocol::CancelLoginAccountParams;
@@ -149,6 +147,7 @@ use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
@@ -723,13 +722,6 @@ impl CodexMessageProcessor {
             }
             ClientRequest::AutoReviewStart { request_id, params } => {
                 self.auto_review_start(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::NewConversation { request_id, params } => {
-                // Do not tokio::spawn() to process new_conversation()
-                // asynchronously because we need to ensure the conversation is
-                // created before processing any subsequent messages.
-                self.process_new_conversation(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::GetConversationSummary { request_id, params } => {

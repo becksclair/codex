@@ -70,9 +70,6 @@ use codex_hooks::HookPayload;
 use codex_hooks::HookResult;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
-use codex_network_proxy::NetworkProxy;
-use codex_network_proxy::NetworkProxyAuditMetadata;
-use codex_network_proxy::normalize_host;
 use codex_otel::current_span_w3c_trace_context;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::ThreadId;
@@ -98,6 +95,7 @@ use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::ReviewRequest;
+use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -4912,7 +4910,10 @@ async fn spawn_review_thread(
     .with_speak_tool_enabled(speak_backend_is_configured(config.speak.as_deref()))
     .with_agent_roles(config.agent_roles.clone());
 
-    let review_prompt = resolved.prompt.clone();
+    let review_prompt = match &resolved.target {
+        ReviewTarget::Custom { instructions } => instructions.trim().to_string(),
+        _ => resolved.prompt.clone(),
+    };
     let provider = parent_turn_context.provider.clone();
     let auth_manager = parent_turn_context.auth_manager.clone();
     let model_info = review_model_info.clone();

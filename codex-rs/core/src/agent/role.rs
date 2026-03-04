@@ -248,6 +248,7 @@ Rules:
 - Use long wait timeouts to avoid busy polling.
 - Close the awaiter when you're done with it."#.to_string()),
                         config_file: Some("awaiter.toml".to_string().parse().unwrap_or_default()),
+                        nickname_candidates: None,
                     }
                 )
             ])
