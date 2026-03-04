@@ -949,7 +949,7 @@
         {
           "properties": {
             "id": {
-              "$ref": "#/definitions/RequestId"
+              "$ref": "#/definitions/v2/RequestId"
             },
             "method": {
               "enum": [
