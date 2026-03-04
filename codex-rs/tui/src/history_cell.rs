@@ -2611,8 +2611,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use std::io::Write;
+    use std::path::PathBuf;
 
     use codex_protocol::mcp::CallToolResult;
     use codex_protocol::mcp::Tool;

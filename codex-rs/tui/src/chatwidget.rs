@@ -118,8 +118,6 @@ use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExitedReviewModeEvent;
-use codex_protocol::protocol::IntrospectionExportFormat;
-use codex_protocol::protocol::IntrospectionScope;
 use codex_protocol::protocol::ListCustomPromptsResponseEvent;
 use codex_protocol::protocol::ListSkillsResponseEvent;
 use codex_protocol::protocol::McpListToolsResponseEvent;
@@ -3979,9 +3977,6 @@ impl ChatWidget {
                     self.add_info_message("Plan mode unavailable right now.".to_string(), None);
                 }
             }
-            SlashCommand::Introspect => {
-                self.submit_op(Op::IntrospectionStart { scope: None });
-            }
             SlashCommand::Collab => {
                 if !self.collaboration_modes_enabled() {
                     self.add_info_message(
@@ -4344,84 +4339,6 @@ impl ChatWidget {
                     .send(AppEvent::BeginWindowsSandboxGrantReadRoot {
                         path: prepared_args,
                     });
-                self.bottom_pane.drain_pending_submission_state();
-            }
-            SlashCommand::Introspect => {
-                let mut parts = trimmed.splitn(2, char::is_whitespace);
-                let subcommand = parts.next().unwrap_or_default().trim();
-                let remainder = parts.next().unwrap_or_default().trim();
-                match subcommand {
-                    "" => {
-                        self.submit_op(Op::IntrospectionStart { scope: None });
-                    }
-                    "off" => {
-                        self.submit_op(Op::IntrospectionStop);
-                    }
-                    "why" => {
-                        if remainder.is_empty() {
-                            self.add_error_message(
-                                "Usage: /introspect why <action_id_or_query>".to_string(),
-                            );
-                            return;
-                        }
-                        self.submit_op(Op::IntrospectionWhy {
-                            query: remainder.to_string(),
-                            scope: None,
-                        });
-                    }
-                    "profile" => {
-                        self.submit_op(Op::IntrospectionProfile { scope: None });
-                    }
-                    "motifs" => {
-                        self.submit_op(Op::IntrospectionMotifs { scope: None });
-                    }
-                    "scope" => {
-                        let scope = match remainder {
-                            "turn" => Some(IntrospectionScope::Turn),
-                            "task" => Some(IntrospectionScope::Task),
-                            "session" => Some(IntrospectionScope::Session),
-                            _ => None,
-                        };
-                        let Some(scope) = scope else {
-                            self.add_error_message(
-                                "Usage: /introspect scope <turn|task|session>".to_string(),
-                            );
-                            return;
-                        };
-                        self.submit_op(Op::IntrospectionSetScope { scope });
-                    }
-                    "export" => {
-                        let mut export_parts = remainder.split_whitespace();
-                        let Some(format_raw) = export_parts.next() else {
-                            self.add_error_message(
-                                "Usage: /introspect export <md|json> [cursor]".to_string(),
-                            );
-                            return;
-                        };
-                        let format = match format_raw {
-                            "md" => Some(IntrospectionExportFormat::Md),
-                            "json" => Some(IntrospectionExportFormat::Json),
-                            _ => None,
-                        };
-                        let Some(format) = format else {
-                            self.add_error_message(
-                                "Usage: /introspect export <md|json> [cursor]".to_string(),
-                            );
-                            return;
-                        };
-                        self.submit_op(Op::IntrospectionExport {
-                            format,
-                            cursor: export_parts.next().map(str::to_string),
-                            scope: None,
-                        });
-                    }
-                    _ => {
-                        self.add_error_message(
-                            "Unknown /introspect subcommand. Use why/profile/motifs/scope/export/off."
-                                .to_string(),
-                        );
-                    }
-                }
                 self.bottom_pane.drain_pending_submission_state();
             }
             _ => self.dispatch_command(cmd),
@@ -5012,54 +4929,6 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request, from_replay)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
-            EventMsg::IntrospectionModeChanged(event) => {
-                self.add_info_message(
-                    format!(
-                        "Introspection mode: {:?} (scope: {:?})",
-                        event.mode, event.scope
-                    ),
-                    None,
-                );
-            }
-            EventMsg::IntrospectionSuggestionUpdated(event) => {
-                self.add_info_message(format!("Introspection: {}", event.message), None);
-            }
-            EventMsg::IntrospectionDecisionCardsGenerated(event) => {
-                if let Ok(json) = serde_json::to_string_pretty(&event.cards) {
-                    self.on_agent_message(format!(
-                        "Introspection why ({:?}, query: {}):\n{}",
-                        event.scope, event.query, json
-                    ));
-                } else {
-                    self.on_agent_message("Introspection why results ready.".to_string());
-                }
-            }
-            EventMsg::IntrospectionProfileGenerated(event) => {
-                self.on_agent_message(format!(
-                    "Introspection profile ({:?}): {}\nmetrics: goal={:.2}, decomp={:.2}, uncertainty={:.2}, constraints={:.2}, alternatives={:.2}, recovery={:.2}",
-                    event.scope,
-                    event.summary,
-                    event.metrics.goal_alignment,
-                    event.metrics.decomposition_quality,
-                    event.metrics.uncertainty_calibration,
-                    event.metrics.constraint_adherence,
-                    event.metrics.alternative_quality,
-                    event.metrics.recovery_quality
-                ));
-            }
-            EventMsg::IntrospectionMotifsGenerated(event) => {
-                self.on_agent_message(format!(
-                    "Introspection motifs ({:?}): {} motif(s)",
-                    event.scope,
-                    event.motifs.len()
-                ));
-            }
-            EventMsg::IntrospectionExportReady(event) => {
-                self.on_agent_message(format!(
-                    "Introspection export ({:?}, {:?}):\n{}",
-                    event.scope, event.format, event.payload
-                ));
-            }
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
             EventMsg::CollabAgentSpawnBegin(_) => {}
             EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(multi_agents::spawn_end(ev)),
