@@ -428,6 +428,15 @@ pub(crate) enum AppEvent {
         collaboration_mode: CollaborationModeMask,
     },
 
+    /// Run a compact turn first, then auto-submit a follow-up user message.
+    ///
+    /// Used by the plan-implementation popup so compaction can finish before
+    /// "Implement the plan." is submitted in Default mode.
+    CompactAndImplementPlan {
+        text: String,
+        collaboration_mode: CollaborationModeMask,
+    },
+
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
 

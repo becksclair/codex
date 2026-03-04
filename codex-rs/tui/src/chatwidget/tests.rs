@@ -91,6 +91,8 @@ use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
+use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UndoCompletedEvent;
@@ -1815,6 +1817,7 @@ async fn make_chatwidget_manual(
         startup_tooltip_override: None,
         queued_user_messages: VecDeque::new(),
         pending_steers: VecDeque::new(),
+        pending_plan_implementation_after_compact: None,
         queued_message_edit_binding: crate::key_hint::alt(KeyCode::Up),
         suppress_session_configured_redraw: false,
         pending_notification: None,
@@ -2310,6 +2313,16 @@ async fn plan_implementation_popup_no_selected_snapshot() {
 }
 
 #[tokio::test]
+async fn plan_implementation_popup_compact_default_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.set_token_info(Some(make_token_info(35_000, 100_000)));
+    chat.open_plan_implementation_prompt();
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert_snapshot!("plan_implementation_popup_compact_default", popup);
+}
+
+#[tokio::test]
 async fn plan_implementation_popup_yes_emits_submit_message_event() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
     chat.open_plan_implementation_prompt();
@@ -2326,6 +2339,233 @@ async fn plan_implementation_popup_yes_emits_submit_message_event() {
     };
     assert_eq!(text, PLAN_IMPLEMENTATION_CODING_MESSAGE);
     assert_eq!(collaboration_mode.mode, Some(ModeKind::Default));
+}
+
+#[tokio::test]
+async fn plan_implementation_popup_compact_default_emits_compact_and_implement_event() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.set_token_info(Some(make_token_info(35_000, 100_000)));
+    chat.open_plan_implementation_prompt();
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let event = rx.try_recv().expect("expected AppEvent");
+    let AppEvent::CompactAndImplementPlan {
+        text,
+        collaboration_mode,
+    } = event
+    else {
+        panic!("expected CompactAndImplementPlan, got {event:?}");
+    };
+    assert_eq!(text, PLAN_IMPLEMENTATION_CODING_MESSAGE);
+    assert_eq!(collaboration_mode.mode, Some(ModeKind::Default));
+    assert!(
+        rx.try_recv().is_err(),
+        "expected no extra events after compact-and-implement action"
+    );
+}
+
+#[tokio::test]
+async fn pending_plan_implementation_after_compact_submits_on_turn_complete() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
+
+    let default_mode = collaboration_modes::default_mask(chat.models_manager.as_ref())
+        .expect("expected default collaboration mode");
+    chat.pending_plan_implementation_after_compact = Some(PendingPlanImplementationAfterCompact {
+        text: PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string(),
+        collaboration_mode: default_mode,
+    });
+
+    chat.on_task_complete(Some("Context compacted".to_string()), false);
+
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn {
+            collaboration_mode: Some(CollaborationMode { mode, .. }),
+            personality: None,
+            ..
+        } => assert_eq!(mode, ModeKind::Default),
+        other => panic!("expected Op::UserTurn with default collab mode, got {other:?}"),
+    }
+    assert!(
+        chat.pending_plan_implementation_after_compact.is_none(),
+        "expected pending compact handoff to be consumed"
+    );
+}
+
+#[tokio::test]
+async fn pending_compact_handoff_and_queue_submit_only_one_turn_per_completion() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
+
+    let default_mode = collaboration_modes::default_mask(chat.models_manager.as_ref())
+        .expect("expected default collaboration mode");
+    chat.pending_plan_implementation_after_compact = Some(PendingPlanImplementationAfterCompact {
+        text: PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string(),
+        collaboration_mode: default_mode,
+    });
+    chat.queued_user_messages
+        .push_back(UserMessage::from("queued follow-up"));
+
+    chat.on_task_complete(Some("Context compacted".to_string()), false);
+
+    let first_items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn for compact handoff, got {other:?}"),
+    };
+    assert_eq!(
+        first_items,
+        vec![UserInput::Text {
+            text: PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string(),
+            text_elements: Vec::new(),
+        }]
+    );
+    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(
+        chat.queued_user_messages.front().unwrap().text,
+        "queued follow-up"
+    );
+    assert_no_submit_op(&mut op_rx);
+
+    // Next completion cycle should drain one queued follow-up.
+    chat.on_task_started();
+    chat.on_task_complete(None, false);
+    let queued_items = match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => items,
+        other => panic!("expected Op::UserTurn for queued follow-up, got {other:?}"),
+    };
+    assert_eq!(
+        queued_items,
+        vec![UserInput::Text {
+            text: "queued follow-up".to_string(),
+            text_elements: Vec::new(),
+        }]
+    );
+    assert!(chat.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn turn_aborted_clears_pending_plan_implementation_after_compact() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
+
+    let default_mode = collaboration_modes::default_mask(chat.models_manager.as_ref())
+        .expect("expected default collaboration mode");
+    chat.pending_plan_implementation_after_compact = Some(PendingPlanImplementationAfterCompact {
+        text: PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string(),
+        collaboration_mode: default_mode,
+    });
+
+    chat.handle_codex_event(Event {
+        id: "turn-aborted".to_string(),
+        msg: EventMsg::TurnAborted(TurnAbortedEvent {
+            turn_id: Some("turn-aborted".to_string()),
+            reason: TurnAbortReason::Replaced,
+        }),
+    });
+
+    assert!(
+        chat.pending_plan_implementation_after_compact.is_none(),
+        "expected pending compact handoff to be cleared on turn abort"
+    );
+    chat.on_task_complete(Some("later turn complete".to_string()), false);
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn error_event_clears_pending_plan_implementation_after_compact() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
+
+    let default_mode = collaboration_modes::default_mask(chat.models_manager.as_ref())
+        .expect("expected default collaboration mode");
+    chat.pending_plan_implementation_after_compact = Some(PendingPlanImplementationAfterCompact {
+        text: PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string(),
+        collaboration_mode: default_mode,
+    });
+
+    chat.handle_codex_event(Event {
+        id: "error".to_string(),
+        msg: EventMsg::Error(ErrorEvent {
+            message: "compact failed".to_string(),
+            codex_error_info: Some(CodexErrorInfo::Other),
+        }),
+    });
+
+    assert!(
+        chat.pending_plan_implementation_after_compact.is_none(),
+        "expected pending compact handoff to be cleared on error events"
+    );
+    chat.on_task_complete(Some("later turn complete".to_string()), false);
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn server_overloaded_error_clears_pending_plan_implementation_after_compact() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
+
+    let default_mode = collaboration_modes::default_mask(chat.models_manager.as_ref())
+        .expect("expected default collaboration mode");
+    chat.pending_plan_implementation_after_compact = Some(PendingPlanImplementationAfterCompact {
+        text: PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string(),
+        collaboration_mode: default_mode,
+    });
+
+    chat.handle_codex_event(Event {
+        id: "error-overloaded".to_string(),
+        msg: EventMsg::Error(ErrorEvent {
+            message: "overloaded".to_string(),
+            codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
+        }),
+    });
+
+    assert!(
+        chat.pending_plan_implementation_after_compact.is_none(),
+        "expected pending compact handoff to be cleared on overloaded errors"
+    );
+    chat.on_task_complete(Some("later turn complete".to_string()), false);
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn replayed_turn_complete_does_not_submit_pending_plan_implementation_after_compact() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_feature_enabled(Feature::CollaborationModes, true);
+
+    let default_mode = collaboration_modes::default_mask(chat.models_manager.as_ref())
+        .expect("expected default collaboration mode");
+    chat.pending_plan_implementation_after_compact = Some(PendingPlanImplementationAfterCompact {
+        text: PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string(),
+        collaboration_mode: default_mode,
+    });
+
+    chat.on_task_complete(Some("replayed".to_string()), true);
+
+    assert_no_submit_op(&mut op_rx);
+    assert!(
+        chat.pending_plan_implementation_after_compact.is_some(),
+        "expected replayed turn completion to leave pending compact handoff untouched"
+    );
+}
+
+#[tokio::test]
+async fn plan_implementation_popup_does_not_show_compact_option_when_context_is_80_or_more() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+    chat.set_token_info(Some(make_token_info(29_600, 100_000)));
+    chat.open_plan_implementation_prompt();
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(
+        !popup.contains(PLAN_IMPLEMENTATION_COMPACT_AND_YES),
+        "expected no compact option when context remaining is >=80%, got {popup:?}"
+    );
 }
 
 #[tokio::test]

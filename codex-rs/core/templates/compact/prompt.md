@@ -5,5 +5,6 @@ Include:
 - Important context, constraints, or user preferences
 - What remains to be done (clear next steps)
 - Any critical data, examples, or references needed to continue
+- If there is an implementation plan, preserve implementation-ready detail (accepted approach, step order, constraints, open questions, and acceptance criteria)
 
 Be concise, structured, and focused on helping the next LLM seamlessly continue the work.

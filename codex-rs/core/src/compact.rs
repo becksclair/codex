@@ -493,6 +493,18 @@ mod tests {
     }
 
     #[test]
+    fn summarization_prompt_preserves_implementation_plan_details() {
+        assert!(
+            SUMMARIZATION_PROMPT.contains("implementation plan"),
+            "expected compact prompt to preserve implementation plan details"
+        );
+        assert!(
+            SUMMARIZATION_PROMPT.contains("acceptance criteria"),
+            "expected compact prompt to preserve acceptance criteria"
+        );
+    }
+
+    #[test]
     fn collect_user_messages_extracts_user_text_only() {
         let items = vec![
             ResponseItem::Message {

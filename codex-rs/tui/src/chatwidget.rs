@@ -115,6 +115,8 @@ use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExitedReviewModeEvent;
+use codex_protocol::protocol::IntrospectionExportFormat;
+use codex_protocol::protocol::IntrospectionScope;
 use codex_protocol::protocol::ListCustomPromptsResponseEvent;
 use codex_protocol::protocol::ListSkillsResponseEvent;
 use codex_protocol::protocol::McpListToolsResponseEvent;
@@ -169,6 +171,7 @@ use tracing::warn;
 
 const DEFAULT_MODEL_DISPLAY_NAME: &str = "loading";
 const PLAN_IMPLEMENTATION_TITLE: &str = "Implement this plan?";
+const PLAN_IMPLEMENTATION_COMPACT_AND_YES: &str = "Compact context and implement plan";
 const PLAN_IMPLEMENTATION_YES: &str = "Yes, implement this plan";
 const PLAN_IMPLEMENTATION_NO: &str = "No, stay in Plan mode";
 const PLAN_IMPLEMENTATION_CODING_MESSAGE: &str = "Implement the plan.";
@@ -176,6 +179,7 @@ const MULTI_AGENT_ENABLE_TITLE: &str = "Enable multi-agent?";
 const MULTI_AGENT_ENABLE_YES: &str = "Yes, enable";
 const MULTI_AGENT_ENABLE_NO: &str = "Not now";
 const MULTI_AGENT_ENABLE_NOTICE: &str = "Multi-agent will be enabled in the next session.";
+const PLAN_IMPLEMENTATION_COMPACT_THRESHOLD_PERCENT: i64 = 80;
 const PLAN_MODE_REASONING_SCOPE_TITLE: &str = "Apply reasoning change";
 const PLAN_MODE_REASONING_SCOPE_PLAN_ONLY: &str = "Apply to Plan mode override";
 const PLAN_MODE_REASONING_SCOPE_ALL_MODES: &str = "Apply to global default and Plan mode override";
@@ -637,6 +641,8 @@ pub(crate) struct ChatWidget {
     // The bottom pane shows these above queued drafts until core records the
     // corresponding user message item.
     pending_steers: VecDeque<PendingSteer>,
+    // Follow-up plan implementation message submitted after compact completes.
+    pending_plan_implementation_after_compact: Option<PendingPlanImplementationAfterCompact>,
     /// Terminal-appropriate keybinding for popping the most-recently queued
     /// message back into the composer.  Determined once at construction time via
     /// [`queued_message_edit_binding_for_terminal`] and propagated to
@@ -776,6 +782,12 @@ pub(crate) struct ThreadInputState {
     current_collaboration_mode: CollaborationMode,
     active_collaboration_mask: Option<CollaborationModeMask>,
     agent_turn_running: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingPlanImplementationAfterCompact {
+    text: String,
+    collaboration_mode: CollaborationModeMask,
 }
 
 impl From<String> for UserMessage {
@@ -1577,8 +1589,20 @@ impl ChatWidget {
 
         let had_pending_steers = !self.pending_steers.is_empty();
         self.refresh_pending_input_preview();
+        let submitted_pending_plan_implementation = if from_replay {
+            false
+        } else if let Some(pending) = self.pending_plan_implementation_after_compact.take() {
+            self.submit_user_message_with_mode(pending.text, pending.collaboration_mode);
+            true
+        } else {
+            false
+        };
 
-        if !from_replay && self.queued_user_messages.is_empty() && !had_pending_steers {
+        if !from_replay
+            && !submitted_pending_plan_implementation
+            && self.queued_user_messages.is_empty()
+            && !had_pending_steers
+        {
             self.maybe_prompt_plan_implementation();
         }
         // Keep this flag for replayed completion events so a subsequent live TurnComplete can
@@ -1587,7 +1611,11 @@ impl ChatWidget {
             self.saw_plan_item_this_turn = false;
         }
         // If there is a queued user message, send exactly one now to begin the next turn.
-        self.maybe_send_next_queued_input();
+        // Skip queue-drain when we already submitted the compact handoff in this completion path;
+        // that preserves the one-submit-per-completion invariant.
+        if !submitted_pending_plan_implementation {
+            self.maybe_send_next_queued_input();
+        }
         // Emit a notification when the turn completes (suppressed if focused).
         self.notify(Notification::AgentTurnComplete {
             response: last_agent_message.unwrap_or_default(),
@@ -1625,40 +1653,75 @@ impl ChatWidget {
 
     fn open_plan_implementation_prompt(&mut self) {
         let default_mask = collaboration_modes::default_mode_mask(self.models_manager.as_ref());
-        let (implement_actions, implement_disabled_reason) = match default_mask {
+        let (
+            compact_and_implement_actions,
+            compact_and_implement_disabled_reason,
+            implement_actions,
+            implement_disabled_reason,
+        ) = match default_mask {
             Some(mask) => {
                 let user_text = PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string();
+                let implement_mask = mask.clone();
                 let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
                     tx.send(AppEvent::SubmitUserMessageWithMode {
                         text: user_text.clone(),
-                        collaboration_mode: mask.clone(),
+                        collaboration_mode: implement_mask.clone(),
                     });
                 })];
-                (actions, None)
+                let compact_user_text = PLAN_IMPLEMENTATION_CODING_MESSAGE.to_string();
+                let compact_mask = mask.clone();
+                let compact_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                    tx.send(AppEvent::CompactAndImplementPlan {
+                        text: compact_user_text.clone(),
+                        collaboration_mode: compact_mask.clone(),
+                    });
+                })];
+                (compact_actions, None, actions, None)
             }
-            None => (Vec::new(), Some("Default mode unavailable".to_string())),
+            None => {
+                let reason = "Default mode unavailable".to_string();
+                (Vec::new(), Some(reason.clone()), Vec::new(), Some(reason))
+            }
         };
-        let items = vec![
-            SelectionItem {
-                name: PLAN_IMPLEMENTATION_YES.to_string(),
-                description: Some("Switch to Default and start coding.".to_string()),
+        let mut items = Vec::new();
+        if self
+            .token_info
+            .as_ref()
+            .and_then(|info| self.context_remaining_percent(info))
+            .is_some_and(|percent| percent < PLAN_IMPLEMENTATION_COMPACT_THRESHOLD_PERCENT)
+        {
+            items.push(SelectionItem {
+                name: PLAN_IMPLEMENTATION_COMPACT_AND_YES.to_string(),
+                description: Some(
+                    "Compact context first, then switch to Default and start coding.".to_string(),
+                ),
                 selected_description: None,
                 is_current: false,
-                actions: implement_actions,
-                disabled_reason: implement_disabled_reason,
+                actions: compact_and_implement_actions,
+                disabled_reason: compact_and_implement_disabled_reason,
                 dismiss_on_select: true,
                 ..Default::default()
-            },
-            SelectionItem {
-                name: PLAN_IMPLEMENTATION_NO.to_string(),
-                description: Some("Continue planning with the model.".to_string()),
-                selected_description: None,
-                is_current: false,
-                actions: Vec::new(),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ];
+            });
+        }
+        items.push(SelectionItem {
+            name: PLAN_IMPLEMENTATION_YES.to_string(),
+            description: Some("Switch to Default and start coding.".to_string()),
+            selected_description: None,
+            is_current: false,
+            actions: implement_actions,
+            disabled_reason: implement_disabled_reason,
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+        items.push(SelectionItem {
+            name: PLAN_IMPLEMENTATION_NO.to_string(),
+            description: Some("Continue planning with the model.".to_string()),
+            selected_description: None,
+            is_current: false,
+            actions: Vec::new(),
+            dismiss_on_select: true,
+            ..Default::default()
+        });
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some(PLAN_IMPLEMENTATION_TITLE.to_string()),
@@ -1839,6 +1902,7 @@ impl ChatWidget {
     fn finalize_turn(&mut self) {
         // Ensure any spinner is replaced by a red ✗ and flushed into history.
         self.finalize_active_cell_as_failed();
+        self.clear_pending_plan_implementation_after_compact();
         // Reset running state and clear streaming buffers.
         self.agent_turn_running = false;
         self.turn_sleep_inhibitor.set_turn_running(false);
@@ -3110,6 +3174,7 @@ impl ChatWidget {
             forked_from: None,
             queued_user_messages: VecDeque::new(),
             pending_steers: VecDeque::new(),
+            pending_plan_implementation_after_compact: None,
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
             startup_tooltip_override,
@@ -3296,6 +3361,7 @@ impl ChatWidget {
             plan_item_active: false,
             queued_user_messages: VecDeque::new(),
             pending_steers: VecDeque::new(),
+            pending_plan_implementation_after_compact: None,
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
             startup_tooltip_override,
@@ -3463,6 +3529,7 @@ impl ChatWidget {
             forked_from: None,
             queued_user_messages: VecDeque::new(),
             pending_steers: VecDeque::new(),
+            pending_plan_implementation_after_compact: None,
             queued_message_edit_binding,
             show_welcome_banner: false,
             startup_tooltip_override: None,
@@ -3854,6 +3921,9 @@ impl ChatWidget {
                     self.add_info_message("Plan mode unavailable right now.".to_string(), None);
                 }
             }
+            SlashCommand::Introspect => {
+                self.submit_op(Op::IntrospectionStart { scope: None });
+            }
             SlashCommand::Collab => {
                 if !self.collaboration_modes_enabled() {
                     self.add_info_message(
@@ -4216,6 +4286,84 @@ impl ChatWidget {
                     .send(AppEvent::BeginWindowsSandboxGrantReadRoot {
                         path: prepared_args,
                     });
+                self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::Introspect => {
+                let mut parts = trimmed.splitn(2, char::is_whitespace);
+                let subcommand = parts.next().unwrap_or_default().trim();
+                let remainder = parts.next().unwrap_or_default().trim();
+                match subcommand {
+                    "" => {
+                        self.submit_op(Op::IntrospectionStart { scope: None });
+                    }
+                    "off" => {
+                        self.submit_op(Op::IntrospectionStop);
+                    }
+                    "why" => {
+                        if remainder.is_empty() {
+                            self.add_error_message(
+                                "Usage: /introspect why <action_id_or_query>".to_string(),
+                            );
+                            return;
+                        }
+                        self.submit_op(Op::IntrospectionWhy {
+                            query: remainder.to_string(),
+                            scope: None,
+                        });
+                    }
+                    "profile" => {
+                        self.submit_op(Op::IntrospectionProfile { scope: None });
+                    }
+                    "motifs" => {
+                        self.submit_op(Op::IntrospectionMotifs { scope: None });
+                    }
+                    "scope" => {
+                        let scope = match remainder {
+                            "turn" => Some(IntrospectionScope::Turn),
+                            "task" => Some(IntrospectionScope::Task),
+                            "session" => Some(IntrospectionScope::Session),
+                            _ => None,
+                        };
+                        let Some(scope) = scope else {
+                            self.add_error_message(
+                                "Usage: /introspect scope <turn|task|session>".to_string(),
+                            );
+                            return;
+                        };
+                        self.submit_op(Op::IntrospectionSetScope { scope });
+                    }
+                    "export" => {
+                        let mut export_parts = remainder.split_whitespace();
+                        let Some(format_raw) = export_parts.next() else {
+                            self.add_error_message(
+                                "Usage: /introspect export <md|json> [cursor]".to_string(),
+                            );
+                            return;
+                        };
+                        let format = match format_raw {
+                            "md" => Some(IntrospectionExportFormat::Md),
+                            "json" => Some(IntrospectionExportFormat::Json),
+                            _ => None,
+                        };
+                        let Some(format) = format else {
+                            self.add_error_message(
+                                "Usage: /introspect export <md|json> [cursor]".to_string(),
+                            );
+                            return;
+                        };
+                        self.submit_op(Op::IntrospectionExport {
+                            format,
+                            cursor: export_parts.next().map(str::to_string),
+                            scope: None,
+                        });
+                    }
+                    _ => {
+                        self.add_error_message(
+                            "Unknown /introspect subcommand. Use why/profile/motifs/scope/export/off."
+                                .to_string(),
+                        );
+                    }
+                }
                 self.bottom_pane.drain_pending_submission_state();
             }
             _ => self.dispatch_command(cmd),
@@ -4806,6 +4954,54 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request, from_replay)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
+            EventMsg::IntrospectionModeChanged(event) => {
+                self.add_info_message(
+                    format!(
+                        "Introspection mode: {:?} (scope: {:?})",
+                        event.mode, event.scope
+                    ),
+                    None,
+                );
+            }
+            EventMsg::IntrospectionSuggestionUpdated(event) => {
+                self.add_info_message(format!("Introspection: {}", event.message), None);
+            }
+            EventMsg::IntrospectionDecisionCardsGenerated(event) => {
+                if let Ok(json) = serde_json::to_string_pretty(&event.cards) {
+                    self.on_agent_message(format!(
+                        "Introspection why ({:?}, query: {}):\n{}",
+                        event.scope, event.query, json
+                    ));
+                } else {
+                    self.on_agent_message("Introspection why results ready.".to_string());
+                }
+            }
+            EventMsg::IntrospectionProfileGenerated(event) => {
+                self.on_agent_message(format!(
+                    "Introspection profile ({:?}): {}\nmetrics: goal={:.2}, decomp={:.2}, uncertainty={:.2}, constraints={:.2}, alternatives={:.2}, recovery={:.2}",
+                    event.scope,
+                    event.summary,
+                    event.metrics.goal_alignment,
+                    event.metrics.decomposition_quality,
+                    event.metrics.uncertainty_calibration,
+                    event.metrics.constraint_adherence,
+                    event.metrics.alternative_quality,
+                    event.metrics.recovery_quality
+                ));
+            }
+            EventMsg::IntrospectionMotifsGenerated(event) => {
+                self.on_agent_message(format!(
+                    "Introspection motifs ({:?}): {} motif(s)",
+                    event.scope,
+                    event.motifs.len()
+                ));
+            }
+            EventMsg::IntrospectionExportReady(event) => {
+                self.on_agent_message(format!(
+                    "Introspection export ({:?}, {:?}):\n{}",
+                    event.scope, event.format, event.payload
+                ));
+            }
             EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
             EventMsg::CollabAgentSpawnBegin(_) => {}
             EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(multi_agents::spawn_end(ev)),
@@ -7946,6 +8142,22 @@ impl ChatWidget {
         } else {
             self.submit_user_message(user_message);
         }
+    }
+
+    pub(crate) fn prepare_plan_implementation_after_compact(
+        &mut self,
+        text: String,
+        collaboration_mode: CollaborationModeMask,
+    ) {
+        self.pending_plan_implementation_after_compact =
+            Some(PendingPlanImplementationAfterCompact {
+                text,
+                collaboration_mode,
+            });
+    }
+
+    pub(crate) fn clear_pending_plan_implementation_after_compact(&mut self) {
+        self.pending_plan_implementation_after_compact = None;
     }
 
     /// True when the UI is in the regular composer state with no running task,

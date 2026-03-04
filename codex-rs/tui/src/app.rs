@@ -3145,6 +3145,25 @@ impl App {
                 self.chat_widget
                     .submit_user_message_with_mode(text, collaboration_mode);
             }
+            AppEvent::CompactAndImplementPlan {
+                text,
+                collaboration_mode,
+            } => {
+                self.chat_widget
+                    .prepare_plan_implementation_after_compact(text, collaboration_mode);
+                let op = Op::Compact;
+                let replay_state_op =
+                    ThreadEventStore::op_can_change_pending_replay_state(&op).then(|| op.clone());
+                let submitted = self.chat_widget.submit_op(op);
+                if submitted && let Some(op) = replay_state_op.as_ref() {
+                    self.note_active_thread_outbound_op(op).await;
+                    self.refresh_pending_thread_approvals().await;
+                }
+                if !submitted {
+                    self.chat_widget
+                        .clear_pending_plan_implementation_after_compact();
+                }
+            }
             AppEvent::ManageSkillsClosed => {
                 self.chat_widget.handle_manage_skills_closed();
             }
