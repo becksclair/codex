@@ -15,6 +15,7 @@ use crate::memories::citations::get_thread_id_from_citations;
 use crate::parse_turn_item;
 use crate::state_db;
 use crate::tools::parallel::ToolCallRuntime;
+use crate::tools::registry::log_payload_for_tool;
 use crate::tools::router::ToolRouter;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -134,7 +135,7 @@ pub(crate) async fn handle_output_item_done(
     match ToolRouter::build_tool_call(ctx.sess.as_ref(), item.clone()).await {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
         Ok(Some(call)) => {
-            let payload_preview = call.payload.log_payload().into_owned();
+            let payload_preview = log_payload_for_tool(&call.tool_name, &call.payload).into_owned();
             tracing::info!(
                 thread_id = %ctx.sess.conversation_id,
                 "ToolCall: {} {}",

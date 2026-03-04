@@ -26,6 +26,26 @@ Codex can run a notification hook when the agent finishes a turn. See the config
 
 When Codex knows which client started the turn, the legacy notify JSON payload also includes a top-level `client` field. The TUI reports `codex-tui`, and the app server reports the `clientInfo.name` value from `initialize`.
 
+## Speak
+
+Codex can expose a `speak_voice_message` tool when a speech backend command is configured in `config.toml` via `speak = ["your-command", "arg1", ...]`. Codex appends the spoken message as the final argv argument.
+
+For the latest configuration details and examples, see:
+
+- https://developers.openai.com/codex/config-reference
+
+## Experimental voice features
+
+Codex exposes two under-development voice feature flags under `[features]`:
+
+- `voice_transcription` for hold-to-talk transcription in the composer.
+- `realtime_conversation` for `/realtime` live voice mode.
+
+Both features are disabled by default.
+
+On Linux, local audio support currently targets `linux-gnu` builds. `linux-musl`
+builds still use the non-audio fallback path for these features.
+
 ## JSON Schema
 
 The generated JSON Schema for `config.toml` lives at `codex-rs/core/config.schema.json`.

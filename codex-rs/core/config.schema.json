@@ -2186,6 +2186,14 @@
       ],
       "description": "User-level skill config entries keyed by SKILL.md path."
     },
+    "speak": {
+      "default": null,
+      "description": "Optional external command used by `speak_voice_message`.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "sqlite_home": {
       "allOf": [
         {

@@ -113,7 +113,11 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+          packages=(pkg-config libcap-dev)
+          if [[ "${{ matrix.target }}" == 'x86_64-unknown-linux-gnu' || "${{ matrix.target }}" == 'aarch64-unknown-linux-gnu' ]]; then
+            packages+=(libasound2-dev)
+          fi
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
       - name: Install UBSan runtime (musl)
         if: ${{ matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' }}
         shell: bash

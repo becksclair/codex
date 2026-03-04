@@ -10,6 +10,7 @@ use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::tools::handlers::PLAN_TOOL;
 use crate::tools::handlers::SEARCH_TOOL_BM25_DEFAULT_LIMIT;
 use crate::tools::handlers::SEARCH_TOOL_BM25_TOOL_NAME;
+use crate::tools::handlers::SPEAK_VOICE_MESSAGE_TOOL_NAME;
 use crate::tools::handlers::agent_jobs::BatchJobHandler;
 use crate::tools::handlers::apply_patch::create_apply_patch_freeform_tool;
 use crate::tools::handlers::apply_patch::create_apply_patch_json_tool;
@@ -61,6 +62,8 @@ pub(crate) struct ToolsConfig {
     pub experimental_supported_tools: Vec<String>,
     pub agent_jobs_tools: bool,
     pub agent_jobs_worker_tools: bool,
+    speak_tool_allowed_for_session: bool,
+    pub speak_tool_enabled: bool,
 }
 
 pub(crate) struct ToolsConfigParams<'a> {
@@ -91,6 +94,7 @@ impl ToolsConfig {
             features.enabled(Feature::ImageGeneration) && supports_image_generation(model_info);
         let include_agent_jobs = include_collab_tools && features.enabled(Feature::Sqlite);
         let request_permission_enabled = features.enabled(Feature::RequestPermissions);
+        let speak_tool_allowed_for_session = !matches!(session_source, SessionSource::SubAgent(_));
         let shell_command_backend =
             if features.enabled(Feature::ShellTool) && features.enabled(Feature::ShellZshFork) {
                 ShellCommandBackendConfig::ZshFork
@@ -150,6 +154,8 @@ impl ToolsConfig {
             experimental_supported_tools: model_info.experimental_supported_tools.clone(),
             agent_jobs_tools: include_agent_jobs,
             agent_jobs_worker_tools,
+            speak_tool_allowed_for_session,
+            speak_tool_enabled: false,
         }
     }
 
@@ -160,6 +166,11 @@ impl ToolsConfig {
 
     pub fn with_allow_login_shell(mut self, allow_login_shell: bool) -> Self {
         self.allow_login_shell = allow_login_shell;
+        self
+    }
+
+    pub fn with_speak_tool_enabled(mut self, enabled: bool) -> Self {
+        self.speak_tool_enabled = self.speak_tool_allowed_for_session && enabled;
         self
     }
 }
@@ -658,6 +669,27 @@ fn create_spreadsheet_artifact_tool() -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["action".to_string(), "args".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_speak_voice_message_tool() -> ToolSpec {
+    let properties = BTreeMap::from([(
+        "message".to_string(),
+        JsonSchema::String {
+            description: Some("Text content to speak out loud.".to_string()),
+        },
+    )]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: SPEAK_VOICE_MESSAGE_TOOL_NAME.to_string(),
+        description: "Speak a message out loud using the configured `speak` backend command. Prefer this tool over running shell `say`/TTS commands directly."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["message".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -1803,6 +1835,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::ShellCommandHandler;
     use crate::tools::handlers::ShellHandler;
     use crate::tools::handlers::SpreadsheetArtifactHandler;
+    use crate::tools::handlers::SpeakVoiceMessageHandler;
     use crate::tools::handlers::TestSyncHandler;
     use crate::tools::handlers::UnifiedExecHandler;
     use crate::tools::handlers::ViewImageHandler;
@@ -1827,6 +1860,7 @@ pub(crate) fn build_specs(
     let js_repl_reset_handler = Arc::new(JsReplResetHandler);
     let presentation_artifact_handler = Arc::new(PresentationArtifactHandler);
     let spreadsheet_artifact_handler = Arc::new(SpreadsheetArtifactHandler);
+    let speak_voice_message_handler = Arc::new(SpeakVoiceMessageHandler);
     let request_permission_enabled = config.request_permission_enabled;
 
     match &config.shell_type {
@@ -1973,6 +2007,11 @@ pub(crate) fn build_specs(
         builder.push_spec(create_spreadsheet_artifact_tool());
         builder.register_handler("presentation_artifact", presentation_artifact_handler);
         builder.register_handler("spreadsheet_artifact", spreadsheet_artifact_handler);
+    }
+
+    if config.speak_tool_enabled {
+        builder.push_spec_with_parallel_support(create_speak_voice_message_tool(), true);
+        builder.register_handler(SPEAK_VOICE_MESSAGE_TOOL_NAME, speak_voice_message_handler);
     }
 
     if config.collab_tools {
@@ -2375,6 +2414,67 @@ mod tests {
             create_request_user_input_tool(CollaborationModesConfig {
                 default_mode_request_user_input: true,
             })
+        );
+    }
+
+    #[test]
+    fn speak_voice_message_tool_is_hidden_by_default() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let features = Features::with_defaults();
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::Cli,
+        });
+
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| tool.spec.name() == SPEAK_VOICE_MESSAGE_TOOL_NAME)
+        );
+    }
+
+    #[test]
+    fn speak_voice_message_tool_is_included_for_main_sessions_when_enabled() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let features = Features::with_defaults();
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::Cli,
+        })
+        .with_speak_tool_enabled(true);
+
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+        assert_contains_tool_names(&tools, &[SPEAK_VOICE_MESSAGE_TOOL_NAME]);
+    }
+
+    #[test]
+    fn speak_voice_message_tool_is_hidden_for_subagents() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let features = Features::with_defaults();
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+            session_source: SessionSource::SubAgent(SubAgentSource::Other("worker".to_string())),
+        })
+        .with_speak_tool_enabled(true);
+
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+        assert!(
+            !tools
+                .iter()
+                .any(|tool| tool.spec.name() == SPEAK_VOICE_MESSAGE_TOOL_NAME)
         );
     }
 

@@ -41,6 +41,7 @@ pub(crate) struct SessionState {
     pub(crate) active_mcp_tool_selection: Option<Vec<String>>,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) artifacts: SessionArtifacts,
+    speak_failure_warning_emitted: bool,
 }
 
 impl SessionState {
@@ -59,6 +60,7 @@ impl SessionState {
             active_mcp_tool_selection: None,
             active_connector_selection: HashSet::new(),
             artifacts: SessionArtifacts::default(),
+            speak_failure_warning_emitted: false,
         }
     }
 
@@ -245,6 +247,15 @@ impl SessionState {
     // Removes all currently tracked connector selections.
     pub(crate) fn clear_connector_selection(&mut self) {
         self.active_connector_selection.clear();
+    }
+
+    pub(crate) fn mark_speak_failure_warning_emitted(&mut self) -> bool {
+        if self.speak_failure_warning_emitted {
+            false
+        } else {
+            self.speak_failure_warning_emitted = true;
+            true
+        }
     }
 }
 

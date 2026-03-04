@@ -275,6 +275,13 @@ pub struct Config {
     /// If unset the feature is disabled.
     pub notify: Option<Vec<String>>,
 
+    /// Optional external command used by `speak_voice_message`.
+    ///
+    /// The configured command is treated as trusted user configuration and is
+    /// invoked with one extra final argv argument containing the message text.
+    /// If unset, the `speak_voice_message` tool is not exposed to the model.
+    pub speak: Option<Vec<String>>,
+
     /// TUI notifications preference. When set, the TUI will send terminal notifications on
     /// approvals and turn completions when not focused.
     pub tui_notifications: Notifications,
@@ -1059,6 +1066,10 @@ pub struct ConfigToml {
     /// Optional external command to spawn for end-user notifications.
     #[serde(default)]
     pub notify: Option<Vec<String>>,
+
+    /// Optional external command used by `speak_voice_message`.
+    #[serde(default)]
+    pub speak: Option<Vec<String>>,
 
     /// System instructions.
     pub instructions: Option<String>,
@@ -2202,6 +2213,7 @@ impl Config {
             enforce_residency: enforce_residency.value,
             did_user_set_custom_approval_policy_or_sandbox_mode,
             notify: cfg.notify,
+            speak: cfg.speak,
             user_instructions,
             base_instructions,
             personality,
@@ -5319,6 +5331,7 @@ model_verbosity = "high"
                 did_user_set_custom_approval_policy_or_sandbox_mode: true,
                 user_instructions: None,
                 notify: None,
+                speak: None,
                 cwd: fixture.cwd(),
                 cli_auth_credentials_store_mode: Default::default(),
                 mcp_servers: Constrained::allow_any(HashMap::new()),
@@ -5450,6 +5463,7 @@ model_verbosity = "high"
             did_user_set_custom_approval_policy_or_sandbox_mode: true,
             user_instructions: None,
             notify: None,
+            speak: None,
             cwd: fixture.cwd(),
             cli_auth_credentials_store_mode: Default::default(),
             mcp_servers: Constrained::allow_any(HashMap::new()),
@@ -5579,6 +5593,7 @@ model_verbosity = "high"
             did_user_set_custom_approval_policy_or_sandbox_mode: true,
             user_instructions: None,
             notify: None,
+            speak: None,
             cwd: fixture.cwd(),
             cli_auth_credentials_store_mode: Default::default(),
             mcp_servers: Constrained::allow_any(HashMap::new()),
@@ -5694,6 +5709,7 @@ model_verbosity = "high"
             did_user_set_custom_approval_policy_or_sandbox_mode: true,
             user_instructions: None,
             notify: None,
+            speak: None,
             cwd: fixture.cwd(),
             cli_auth_credentials_store_mode: Default::default(),
             mcp_servers: Constrained::allow_any(HashMap::new()),

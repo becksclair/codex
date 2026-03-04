@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +13,7 @@ use crate::sandbox_tags::sandbox_tag;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::handlers::SPEAK_VOICE_MESSAGE_TOOL_NAME;
 use async_trait::async_trait;
 use codex_hooks::HookEvent;
 use codex_hooks::HookEventAfterToolUse;
@@ -22,6 +24,7 @@ use codex_hooks::HookToolInputLocalShell;
 use codex_hooks::HookToolKind;
 use codex_protocol::models::ResponseInputItem;
 use codex_utils_readiness::Readiness;
+use serde::Deserialize;
 use tracing::warn;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -84,7 +87,7 @@ impl ToolRegistry {
         let call_id_owned = invocation.call_id.clone();
         let otel = invocation.turn.otel_manager.clone();
         let payload_for_response = invocation.payload.clone();
-        let log_payload = payload_for_response.log_payload();
+        let log_payload = log_payload_for_tool(tool_name.as_str(), &payload_for_response);
         let metric_tags = [
             (
                 "sandbox",
@@ -373,7 +376,7 @@ async fn dispatch_after_tool_use_hook(
     let AfterToolUseHookDispatch { invocation, .. } = dispatch;
     let session = invocation.session.as_ref();
     let turn = invocation.turn.as_ref();
-    let tool_input = HookToolInput::from(&invocation.payload);
+    let tool_input = hook_tool_input_for_dispatch(&invocation.tool_name, &invocation.payload);
     let hook_outcomes = session
         .hooks()
         .dispatch(HookPayload {
@@ -434,4 +437,66 @@ async fn dispatch_after_tool_use_hook(
     }
 
     None
+}
+
+fn hook_tool_input_for_dispatch(tool_name: &str, payload: &ToolPayload) -> HookToolInput {
+    if tool_name == SPEAK_VOICE_MESSAGE_TOOL_NAME {
+        return HookToolInput::Function {
+            arguments: redacted_speak_voice_message_arguments(payload).into_owned(),
+        };
+    }
+    HookToolInput::from(payload)
+}
+
+pub(crate) fn log_payload_for_tool<'a>(tool_name: &str, payload: &'a ToolPayload) -> Cow<'a, str> {
+    if tool_name == SPEAK_VOICE_MESSAGE_TOOL_NAME {
+        return redacted_speak_voice_message_arguments(payload);
+    }
+    payload.log_payload()
+}
+
+#[derive(Deserialize)]
+struct SpeakVoiceMessageArguments {
+    message: String,
+}
+
+fn redacted_speak_voice_message_arguments(payload: &ToolPayload) -> Cow<'static, str> {
+    let ToolPayload::Function { arguments } = payload else {
+        return Cow::Borrowed(r#"{"message":"[REDACTED]"}"#);
+    };
+
+    match serde_json::from_str::<SpeakVoiceMessageArguments>(arguments) {
+        Ok(args) => Cow::Owned(format!(
+            r#"{{"message":"[REDACTED]","message_length":{}}}"#,
+            args.message.chars().count()
+        )),
+        Err(_) => Cow::Borrowed(r#"{"message":"[REDACTED]"}"#),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn speak_voice_message_payload_logging_is_redacted() {
+        let payload = ToolPayload::Function {
+            arguments: r#"{"message":"super secret"}"#.to_string(),
+        };
+        let redacted = log_payload_for_tool(SPEAK_VOICE_MESSAGE_TOOL_NAME, &payload);
+        assert_eq!(
+            redacted.as_ref(),
+            r#"{"message":"[REDACTED]","message_length":12}"#
+        );
+    }
+
+    #[test]
+    fn non_speak_payload_logging_is_unchanged() {
+        let payload = ToolPayload::Function {
+            arguments: r#"{"k":"v"}"#.to_string(),
+        };
+        let logged = log_payload_for_tool("other_tool", &payload);
+        assert_eq!(logged.as_ref(), r#"{"k":"v"}"#);
+    }
 }

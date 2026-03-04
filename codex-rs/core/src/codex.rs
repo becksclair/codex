@@ -743,6 +743,7 @@ impl TurnContext {
             session_source: self.session_source.clone(),
         })
         .with_allow_login_shell(self.tools_config.allow_login_shell)
+        .with_speak_tool_enabled(speak_backend_is_configured(self.config.speak.as_deref()))
         .with_agent_roles(config.agent_roles.clone());
 
         Self {
@@ -1116,6 +1117,9 @@ impl Session {
             session_source: session_source.clone(),
         })
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
+        .with_speak_tool_enabled(speak_backend_is_configured(
+            per_turn_config.speak.as_deref(),
+        ))
         .with_agent_roles(per_turn_config.agent_roles.clone());
 
         let cwd = session_configuration.cwd.clone();
@@ -1820,6 +1824,11 @@ impl Session {
     ) -> Result<SpreadsheetArtifactResponse, SpreadsheetArtifactError> {
         let mut state = self.state.lock().await;
         state.artifacts.spreadsheet.execute(request, cwd)
+    }
+
+    pub(crate) async fn mark_speak_failure_warning_emitted(&self) -> bool {
+        let mut state = self.state.lock().await;
+        state.mark_speak_failure_warning_emitted()
     }
 
     async fn record_initial_history(&self, conversation_history: InitialHistory) {
@@ -4862,6 +4871,13 @@ mod handlers {
     }
 }
 
+/// Returns true when a `speak` backend command is configured and non-empty.
+fn speak_backend_is_configured(speak_argv: Option<&[String]>) -> bool {
+    speak_argv
+        .and_then(|argv| argv.split_first())
+        .is_some_and(|(program, _)| !program.is_empty())
+}
+
 /// Spawn a review thread using the given prompt.
 async fn spawn_review_thread(
     sess: Arc<Session>,
@@ -4893,6 +4909,7 @@ async fn spawn_review_thread(
         session_source: parent_turn_context.session_source.clone(),
     })
     .with_allow_login_shell(config.permissions.allow_login_shell)
+    .with_speak_tool_enabled(speak_backend_is_configured(config.speak.as_deref()))
     .with_agent_roles(config.agent_roles.clone());
 
     let review_prompt = resolved.prompt.clone();
