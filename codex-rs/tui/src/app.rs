@@ -2124,6 +2124,16 @@ impl App {
                 }
                 self.transcript_cells.push(cell.clone());
                 let mut display = cell.display_lines(tui.terminal.last_known_screen_size.width);
+                for _ in 0..cell.inline_graphics_placeholder_rows() {
+                    display.push(Line::from(""));
+                }
+                // Append inline graphics escape (if any) so it reaches
+                // insert_history_lines, which defers the APC and emits it
+                // as a raw write.  This must NOT go through ratatui's
+                // buffer path — the APC characters would be garbled.
+                if let Some(escape_line) = cell.inline_graphics_escape() {
+                    display.push(escape_line);
+                }
                 if !display.is_empty() {
                     // Only insert a separating blank line for new cells that are not
                     // part of an ongoing stream. Streaming continuations should not

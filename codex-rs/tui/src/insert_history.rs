@@ -57,24 +57,14 @@ where
     // - Non-URL lines also flow through adaptive wrapping; behavior is
     //   equivalent to standard wrapping when no URL is present.
     let wrap_width = area.width.max(1) as usize;
-    let mut wrapped = Vec::new();
-    let mut wrapped_rows = 0usize;
-
-    for line in &lines {
-        let line_wrapped =
-            if line_contains_url_like(line) && !line_has_mixed_url_and_non_url_tokens(line) {
-                vec![line.clone()]
-            } else {
-                adaptive_wrap_line(line, RtOptions::new(wrap_width))
-            };
-        wrapped_rows += line_wrapped
-            .iter()
-            .map(|wrapped_line| wrapped_line.width().max(1).div_ceil(wrap_width))
-            .sum::<usize>();
-        wrapped.extend(line_wrapped);
-    }
+    let (wrapped, wrapped_rows, deferred_graphics_escapes) =
+        wrap_history_lines_for_insert(&lines, wrap_width);
     let wrapped_lines = wrapped_rows as u16;
-    let cursor_top = if area.bottom() < screen_size.height {
+    // scroll_room: how many rows the cursor can move down before hitting
+    // the scroll-region bottom margin.  In the "at bottom" case the cursor
+    // starts at the bottom margin, so every \r\n scrolls (room = 0).  In
+    // the "not at bottom" case the RI scroll creates room below the cursor.
+    let (cursor_top, scroll_room) = if area.bottom() < screen_size.height {
         // If the viewport is not at the bottom of the screen, scroll it down to make room.
         // Don't scroll it past the bottom of the screen.
         let scroll_amount = wrapped_lines.min(screen_size.height - area.bottom());
@@ -97,9 +87,9 @@ where
         let cursor_top = area.top().saturating_sub(1);
         area.y += scroll_amount;
         should_update_area = true;
-        cursor_top
+        (cursor_top, scroll_amount)
     } else {
-        area.top().saturating_sub(1)
+        (area.top().saturating_sub(1), 0u16)
     };
 
     // Limit the scroll region to the lines from the top of the screen to the
@@ -167,6 +157,27 @@ where
 
     queue!(writer, ResetScrollRegion)?;
 
+    // Emit Kitty graphics APC directly after the scroll region is reset.
+    // Content has settled into its final position so we can CUP to the
+    // correct row and write the escape through the backend writer (same
+    // write stream as everything else).
+    //
+    // The last printed line ends up at `final_row`:
+    //   - "at bottom": cursor starts at the scroll-region bottom → every
+    //     \r\n scrolls content up → last line stays at cursor_top.
+    //   - "not at bottom": cursor starts above the bottom margin → the
+    //     first `scroll_room` \r\ns just move the cursor down, then
+    //     remaining ones scroll → last line at cursor_top + min(room, N).
+    for (placeholder_row, escape_content) in deferred_graphics_escapes {
+        let final_row = cursor_top + scroll_room.min(wrapped_lines);
+        if let Some(escape_row) = deferred_escape_row(final_row, wrapped_rows, placeholder_row) {
+            let image_start_row =
+                escape_row.saturating_sub(parse_kitty_display_rows(&escape_content));
+            queue!(writer, MoveTo(0, image_start_row))?;
+            writer.write_all(escape_content.as_bytes())?;
+        }
+    }
+
     // Restore the cursor position to where it was before we started.
     queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
 
@@ -179,6 +190,69 @@ where
     }
 
     Ok(())
+}
+
+fn wrap_history_lines_for_insert<'a>(
+    lines: &'a [Line<'a>],
+    wrap_width: usize,
+) -> (Vec<Line<'a>>, usize, Vec<(usize, String)>) {
+    let mut wrapped: Vec<Line<'a>> = Vec::new();
+    let mut wrapped_rows = 0usize;
+    // Kitty graphics APC escapes must be written outside the DECSTBM scroll
+    // region — terminals don't reliably preserve image placements made inside
+    // a custom scroll region when subsequent LFs scroll the content. We
+    // replace each escape line with a blank placeholder during wrapping and
+    // record every index so we can emit all escapes at the correct screen rows
+    // after the scroll region is reset.
+    let mut deferred_graphics_escapes: Vec<(usize, String)> = Vec::new();
+
+    for line in lines {
+        if is_kitty_graphics_escape(line) {
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            deferred_graphics_escapes.push((wrapped_rows, content));
+            // Blank placeholder — occupies one physical row.
+            wrapped.push(Line::from(""));
+            wrapped_rows += 1;
+            continue;
+        }
+        let line_wrapped =
+            if line_contains_url_like(line) && !line_has_mixed_url_and_non_url_tokens(line) {
+                vec![line.clone()]
+            } else {
+                adaptive_wrap_line(line, RtOptions::new(wrap_width))
+            };
+        wrapped_rows += line_wrapped
+            .iter()
+            .map(|wrapped_line| wrapped_line.width().max(1).div_ceil(wrap_width))
+            .sum::<usize>();
+        wrapped.extend(line_wrapped);
+    }
+
+    (wrapped, wrapped_rows, deferred_graphics_escapes)
+}
+
+fn deferred_escape_row(final_row: u16, wrapped_rows: usize, placeholder_row: usize) -> Option<u16> {
+    let rows_from_bottom = wrapped_rows
+        .saturating_sub(1)
+        .saturating_sub(placeholder_row);
+    if rows_from_bottom > usize::from(final_row) {
+        None
+    } else {
+        Some(final_row - rows_from_bottom as u16)
+    }
+}
+
+/// Parse the `r=N` display rows value from a Kitty graphics APC escape.
+fn parse_kitty_display_rows(escape: &str) -> u16 {
+    escape
+        .find(",r=")
+        .and_then(|pos| {
+            escape[pos + 3..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +362,31 @@ impl ModifierDiff {
     }
 }
 
+/// Returns true if the line contains a Kitty graphics protocol APC escape.
+/// These sequences must be written raw to the terminal — wrapping or injecting
+/// CSI styling around them would break the protocol framing.
+fn is_kitty_graphics_escape(line: &Line) -> bool {
+    let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    is_full_kitty_apc_sequence(&content)
+}
+
+fn is_full_kitty_apc_sequence(content: &str) -> bool {
+    let mut rest = content;
+    let mut saw_frame = false;
+    while let Some(frame_start) = rest.strip_prefix("\x1b_G") {
+        let Some(frame_end) = frame_start.find("\x1b\\") else {
+            return false;
+        };
+        // Require a non-empty payload so we don't treat bare markers as valid.
+        if frame_end == 0 {
+            return false;
+        }
+        rest = &frame_start[(frame_end + 2)..];
+        saw_frame = true;
+    }
+    saw_frame && rest.is_empty()
+}
+
 fn write_spans<'a, I>(mut writer: &mut impl Write, content: I) -> io::Result<()>
 where
     I: IntoIterator<Item = &'a Span<'a>>,
@@ -336,6 +435,68 @@ mod tests {
     use crate::test_backend::VT100Backend;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
+
+    #[test]
+    fn wrap_history_lines_for_insert_keeps_all_deferred_kitty_escapes() {
+        let first_escape = "\x1b_Ga=T,t=f,f=100,q=2,c=10,r=2;Zmlyc3Q=\x1b\\";
+        let second_escape = "\x1b_Ga=T,t=f,f=100,q=2,c=10,r=3;c2Vjb25k\x1b\\";
+        let lines = vec![
+            Line::from(first_escape),
+            Line::from("normal text"),
+            Line::from(second_escape),
+        ];
+
+        let (wrapped, wrapped_rows, deferred_graphics_escapes) =
+            wrap_history_lines_for_insert(&lines, 80);
+
+        pretty_assertions::assert_eq!(
+            wrapped,
+            vec![Line::from(""), Line::from("normal text"), Line::from("")]
+        );
+        assert_eq!(wrapped_rows, 3);
+        assert_eq!(deferred_graphics_escapes.len(), 2);
+        assert_eq!(deferred_graphics_escapes[0], (0, first_escape.to_string()));
+        assert_eq!(deferred_graphics_escapes[1], (2, second_escape.to_string()));
+    }
+
+    #[test]
+    fn deferred_escape_row_uses_physical_rows_not_wrapped_entries() {
+        let escape = "\x1b_Ga=T,t=f,f=100,q=2,c=10,r=2;Zmlyc3Q=\x1b\\";
+        let long_url =
+            "https://example.test/api/v1/projects/alpha-team/releases/2026-02-17/builds/123456";
+        let lines = vec![Line::from(escape), Line::from(long_url)];
+
+        let (wrapped, wrapped_rows, deferred_graphics_escapes) =
+            wrap_history_lines_for_insert(&lines, 20);
+        let (placeholder_row, _) = &deferred_graphics_escapes[0];
+        let final_row = (wrapped_rows - 1) as u16;
+
+        assert_eq!(
+            wrapped.len(),
+            2,
+            "url-only line should stay unwrapped logically"
+        );
+        assert!(
+            wrapped_rows > wrapped.len(),
+            "url-only line should occupy wrapped rows"
+        );
+        assert_eq!(
+            deferred_escape_row(final_row, wrapped_rows, *placeholder_row),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn kitty_escape_detection_requires_full_apc_frames() {
+        assert!(!is_full_kitty_apc_sequence(""));
+        assert!(!is_full_kitty_apc_sequence("prefix \x1b_Ga=T;Zm9v\x1b\\"));
+        assert!(!is_full_kitty_apc_sequence("\x1b_Ga=T;Zm9v\x1b\\ suffix"));
+        assert!(!is_full_kitty_apc_sequence("\x1b_G"));
+        assert!(is_full_kitty_apc_sequence("\x1b_Ga=T;Zm9v\x1b\\"));
+        assert!(is_full_kitty_apc_sequence(
+            "\x1b_Ga=T,t=d,m=1;Zm9v\x1b\\\x1b_Gm=0;YmFy\x1b\\"
+        ));
+    }
 
     #[test]
     fn writes_bold_then_regular_spans() {

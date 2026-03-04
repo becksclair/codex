@@ -72,6 +72,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::any::Any;
 use std::collections::HashMap;
+use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
@@ -149,6 +150,26 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
 
     fn is_stream_continuation(&self) -> bool {
         false
+    }
+
+    /// Returns a Kitty graphics APC escape line to emit via raw terminal write.
+    ///
+    /// This escape must NOT go through ratatui's buffer rendering — the
+    /// APC characters would be split across cells and garble the terminal's
+    /// escape parser.  The caller appends this line only when passing
+    /// lines to `insert_history_lines`, which defers the escape and emits
+    /// it as a raw write outside the synchronized-update block.
+    fn inline_graphics_escape(&self) -> Option<Line<'static>> {
+        None
+    }
+
+    /// Returns blank placeholder rows reserved for inline graphics rendering.
+    ///
+    /// These rows are only needed when emitting `inline_graphics_escape`
+    /// through `insert_history_lines`. Generic render paths that only call
+    /// `display_lines` should not inject these placeholders.
+    fn inline_graphics_placeholder_rows(&self) -> u16 {
+        0
     }
 
     /// Returns a coarse "animation tick" when transcript output is time-dependent.
@@ -2185,15 +2206,189 @@ pub(crate) fn new_patch_apply_failure(stderr: String) -> PlainHistoryCell {
     PlainHistoryCell { lines }
 }
 
-pub(crate) fn new_view_image_tool_call(path: PathBuf, cwd: &Path) -> PlainHistoryCell {
+const VIEW_IMAGE_INLINE_MAX_BYTES: u64 = 15 * 1024 * 1024;
+const VIEW_IMAGE_INLINE_MAX_PIXELS: u64 = 4_096 * 4_096;
+const VIEW_IMAGE_INLINE_MAX_COLS: u16 = 80;
+const VIEW_IMAGE_INLINE_MAX_ROWS: u16 = 24;
+
+/// Compute display dimensions (cols, rows) that preserve the image's visual
+/// aspect ratio within the max inline preview area.  Terminal cells are
+/// roughly twice as tall as they are wide, so we multiply the pixel aspect
+/// ratio by 2 to get the column-to-row ratio.
+fn compute_display_size(img_w: u32, img_h: u32) -> (u16, u16) {
+    let target = (img_w as f64 / img_h as f64) * 2.0;
+    // try fitting to max width
+    let cols = VIEW_IMAGE_INLINE_MAX_COLS;
+    let rows = (f64::from(cols) / target).round().max(1.0) as u16;
+    if rows <= VIEW_IMAGE_INLINE_MAX_ROWS {
+        (cols, rows)
+    } else {
+        // fit to max height instead
+        let rows = VIEW_IMAGE_INLINE_MAX_ROWS;
+        let cols = (f64::from(rows) * target)
+            .round()
+            .max(1.0)
+            .min(f64::from(VIEW_IMAGE_INLINE_MAX_COLS)) as u16;
+        (cols, rows)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ViewImageToolCallCell {
+    lines: Vec<Line<'static>>,
+    transcript_lines: Vec<Line<'static>>,
+    inline_preview_escape: Option<String>,
+    display_rows: u16,
+}
+
+impl HistoryCell for ViewImageToolCallCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        self.lines.clone()
+    }
+
+    fn transcript_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        self.transcript_lines.clone()
+    }
+
+    fn inline_graphics_escape(&self) -> Option<Line<'static>> {
+        self.inline_preview_escape
+            .as_ref()
+            .map(|escape| Line::from(Span::raw(escape.clone())))
+    }
+
+    fn inline_graphics_placeholder_rows(&self) -> u16 {
+        if self.inline_preview_escape.is_some() {
+            self.display_rows
+        } else {
+            0
+        }
+    }
+}
+
+/// The Kitty graphics protocol only accepts PNG (`f=100`) or raw pixel data
+/// for the format hint.  For PNG files we use `t=f` (file transport) which
+/// lets the terminal read the file directly.  For any other format (JPEG,
+/// WebP, GIF, …) we decode with the `image` crate, re-encode to PNG in
+/// memory, and use `t=d` (direct data) with chunked base64 transfer.
+fn build_kitty_graphics_escape(
+    path: &Path,
+    img_w: u32,
+    img_h: u32,
+) -> Result<(String, u16), String> {
+    let (cols, rows) = compute_display_size(img_w, img_h);
+
+    let is_png = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+
+    if is_png {
+        let payload =
+            base64::engine::general_purpose::STANDARD.encode(path.to_string_lossy().as_bytes());
+        Ok((
+            format!("\u{1b}_Ga=T,t=f,f=100,q=2,c={cols},r={rows};{payload}\u{1b}\\"),
+            rows,
+        ))
+    } else {
+        // Transcode to PNG in memory and send via direct data with chunking.
+        let img = ImageReader::open(path)
+            .map_err(|e| format!("could not open image: {e}"))?
+            .with_guessed_format()
+            .map_err(|e| format!("could not detect image format: {e}"))?
+            .decode()
+            .map_err(|e| format!("could not decode image: {e}"))?;
+        let mut png_buf: Vec<u8> = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png_buf), image::ImageFormat::Png)
+            .map_err(|e| format!("could not encode as PNG: {e}"))?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png_buf);
+
+        const CHUNK_SIZE: usize = 4096;
+        let mut escape = String::new();
+        let chunks: Vec<&str> = encoded
+            .as_bytes()
+            .chunks(CHUNK_SIZE)
+            .map(|c| std::str::from_utf8(c).expect("base64 is always valid UTF-8"))
+            .collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let more = if i < chunks.len() - 1 { 1 } else { 0 };
+            if i == 0 {
+                escape.push_str(&format!(
+                    "\u{1b}_Ga=T,t=d,f=100,q=2,c={cols},r={rows},m={more};{chunk}\u{1b}\\"
+                ));
+            } else {
+                escape.push_str(&format!("\u{1b}_Gm={more};{chunk}\u{1b}\\"));
+            }
+        }
+        Ok((escape, rows))
+    }
+}
+
+pub(crate) fn new_view_image_tool_call_with_inline_preview(
+    path: PathBuf,
+    cwd: &Path,
+    supports_inline_preview: bool,
+) -> ViewImageToolCallCell {
     let display_path = display_path_for(&path, cwd);
 
-    let lines: Vec<Line<'static>> = vec![
+    let mut lines: Vec<Line<'static>> = vec![
         vec!["• ".dim(), "Viewed Image".bold()].into(),
         vec!["  └ ".dim(), display_path.dim()].into(),
     ];
+    let mut transcript_lines = lines.clone();
+    let mut inline_preview_escape = None;
 
-    PlainHistoryCell { lines }
+    let mut display_rows = 0u16;
+
+    if supports_inline_preview {
+        let preview_escape = fs::metadata(&path)
+            .map_err(|err| format!("could not read metadata: {err}"))
+            .and_then(|metadata| {
+                if metadata.len() > VIEW_IMAGE_INLINE_MAX_BYTES {
+                    Err(format!(
+                        "preview skipped: image too large (>{VIEW_IMAGE_INLINE_MAX_BYTES} bytes)"
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .and_then(|_| {
+                image::image_dimensions(&path)
+                    .map_err(|err| format!("could not read image dimensions: {err}"))
+                    .and_then(|(width, height)| {
+                        if u64::from(width) * u64::from(height) > VIEW_IMAGE_INLINE_MAX_PIXELS {
+                            Err(format!(
+                                "preview skipped: image dimensions too large ({width}x{height})"
+                            ))
+                        } else {
+                            Ok((width, height))
+                        }
+                    })
+            })
+            .and_then(|(img_w, img_h)| build_kitty_graphics_escape(&path, img_w, img_h));
+        match preview_escape {
+            Ok((escape, rows)) => {
+                display_rows = rows;
+                inline_preview_escape = Some(escape);
+                lines.push(vec!["  └ ".dim(), "inline preview rendered".dim()].into());
+                transcript_lines.push(vec!["  └ ".dim(), "inline preview rendered".dim()].into());
+            }
+            Err(reason) => {
+                lines.push(vec!["  └ ".dim(), reason.clone().dim()].into());
+                transcript_lines.push(vec!["  └ ".dim(), reason.dim()].into());
+            }
+        }
+    } else {
+        let reason = "preview unavailable: terminal does not support kitty graphics protocol";
+        lines.push(vec!["  └ ".dim(), reason.dim()].into());
+        transcript_lines.push(vec!["  └ ".dim(), reason.dim()].into());
+    }
+
+    ViewImageToolCallCell {
+        lines,
+        transcript_lines,
+        inline_preview_escape,
+        display_rows,
+    }
 }
 
 pub(crate) fn new_reasoning_summary_block(full_reasoning_buffer: String) -> Box<dyn HistoryCell> {
@@ -2417,6 +2612,7 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::io::Write;
 
     use codex_protocol::mcp::CallToolResult;
     use codex_protocol::mcp::Tool;
@@ -4064,5 +4260,140 @@ mod tests {
                 "Use flag `bar` instead.".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn view_image_cell_transcript_omits_inline_escape_sequences() {
+        let path = PathBuf::from("/tmp/example.png");
+        let cell = new_view_image_tool_call_with_inline_preview(path, Path::new("/tmp"), true);
+
+        let transcript = render_lines(&cell.transcript_lines(120));
+        assert!(
+            transcript.iter().all(|line| !line.contains('\u{1b}')),
+            "transcript output must not include terminal escape sequences"
+        );
+    }
+
+    #[test]
+    fn view_image_cell_display_lines_omit_placeholders_and_escape() {
+        let image_bytes = base64::engine::general_purpose::STANDARD
+            .decode(SMALL_PNG_BASE64)
+            .expect("decode small png");
+        let mut image_file = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .expect("create temp png file");
+        image_file
+            .write_all(&image_bytes)
+            .expect("write image bytes");
+        let path = image_file.path().to_path_buf();
+
+        let cell = new_view_image_tool_call_with_inline_preview(path, Path::new("/tmp"), true);
+        let lines = render_lines(&cell.display_lines(80));
+
+        // display_lines must NOT contain the escape — it goes through
+        // ratatui's buffer which would garble the APC.
+        assert!(
+            lines.iter().all(|l| !l.contains("\u{1b}_G")),
+            "display_lines must not include kitty graphics escape"
+        );
+
+        // display_lines should not add blank placeholder rows; those are only
+        // emitted on the insert-history path.
+        let blank_count = lines.iter().filter(|l| l.is_empty()).count();
+        assert!(
+            cell.display_rows > 0,
+            "display_rows should be positive for a valid image"
+        );
+        assert_eq!(blank_count, 0, "display_lines should not insert blank rows");
+        assert_eq!(
+            cell.inline_graphics_placeholder_rows(),
+            cell.display_rows,
+            "placeholder rows should move to insert-history path"
+        );
+
+        // The escape is available via inline_graphics_escape()
+        let escape_line = cell
+            .inline_graphics_escape()
+            .expect("should have inline graphics escape");
+        let rendered: String = escape_line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(rendered.contains("\u{1b}_G"), "escape should contain APC");
+        assert!(
+            rendered.contains("t=f"),
+            "should use file transport for PNG"
+        );
+        assert!(rendered.contains("f=100"), "should specify PNG format");
+        assert!(rendered.contains(",r="), "escape should contain row count");
+    }
+
+    #[test]
+    fn view_image_cell_jpeg_uses_chunked_direct_transport() {
+        // Create a tiny 1x1 JPEG via the image crate.
+        let img = image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0]));
+        let mut jpeg_buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg_buf),
+                image::ImageFormat::Jpeg,
+            )
+            .expect("encode tiny jpeg");
+
+        let mut image_file = tempfile::Builder::new()
+            .suffix(".jpg")
+            .tempfile()
+            .expect("create temp jpeg file");
+        image_file.write_all(&jpeg_buf).expect("write jpeg bytes");
+        let path = image_file.path().to_path_buf();
+
+        let cell = new_view_image_tool_call_with_inline_preview(path, Path::new("/tmp"), true);
+
+        let escape_line = cell
+            .inline_graphics_escape()
+            .expect("should have inline graphics escape for JPEG");
+        let rendered: String = escape_line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(rendered.contains("\u{1b}_G"), "escape should contain APC");
+        assert!(
+            rendered.contains("t=d"),
+            "non-PNG should use direct data transport"
+        );
+        assert!(rendered.contains("f=100"), "should re-encode as PNG");
+        assert!(rendered.contains(",r="), "escape should contain row count");
+    }
+
+    #[test]
+    fn compute_display_size_landscape() {
+        // 800x400 landscape: target = (800/400)*2 = 4.0
+        // cols=80, rows = 80/4 = 20 → fits within 24
+        let (cols, rows) = compute_display_size(800, 400);
+        assert_eq!(cols, 80);
+        assert_eq!(rows, 20);
+    }
+
+    #[test]
+    fn compute_display_size_portrait() {
+        // 400x1600 portrait: target = (400/1600)*2 = 0.5
+        // cols=80, rows = 80/0.5 = 160 → overflows 24
+        // fallback: rows=24, cols = 24*0.5 = 12
+        let (cols, rows) = compute_display_size(400, 1600);
+        assert_eq!(rows, 24);
+        assert_eq!(cols, 12);
+    }
+
+    #[test]
+    fn compute_display_size_square() {
+        // 500x500 square: target = (500/500)*2 = 2.0
+        // cols=80, rows = 80/2 = 40 → overflows 24
+        // fallback: rows=24, cols = 24*2 = 48
+        let (cols, rows) = compute_display_size(500, 500);
+        assert_eq!(rows, 24);
+        assert_eq!(cols, 48);
     }
 }

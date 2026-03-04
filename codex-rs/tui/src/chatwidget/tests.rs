@@ -1847,6 +1847,7 @@ async fn make_chatwidget_manual(
         external_editor_state: ExternalEditorState::Closed,
         realtime_conversation: RealtimeConversationUiState::default(),
         last_rendered_user_message_event: None,
+        supports_inline_view_image_preview: false,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
@@ -5953,6 +5954,66 @@ async fn slash_resume_opens_picker() {
     chat.dispatch_command(SlashCommand::Resume);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::OpenResumePicker));
+}
+
+#[tokio::test]
+async fn alt_s_opens_picker_when_idle() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenResumePicker));
+}
+
+#[tokio::test]
+async fn alt_s_is_disabled_while_task_running_and_preserves_pending_input() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.bottom_pane.set_task_running(true);
+
+    let text = "[Image #1] keep $file".to_string();
+    let local_images = vec![PathBuf::from("/tmp/keep.png")];
+    let mention_bindings = vec![MentionBinding {
+        mention: "file".to_string(),
+        path: "/tmp/skills/file/SKILL.md".to_string(),
+    }];
+    let remote_url = "https://example.com/keep.png".to_string();
+    chat.bottom_pane.set_composer_text_with_mention_bindings(
+        text.clone(),
+        Vec::new(),
+        local_images.clone(),
+        mention_bindings.clone(),
+    );
+    chat.set_remote_image_urls(vec![remote_url.clone()]);
+    let expected_text = chat.bottom_pane.composer_text();
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+
+    let event = rx.try_recv().expect("expected disabled command error");
+    match event {
+        AppEvent::InsertHistoryCell(cell) => {
+            let rendered = lines_to_single_string(&cell.display_lines(80));
+            assert!(
+                rendered.contains("'/resume' is disabled while a task is in progress."),
+                "expected /resume task-running error, got {rendered:?}"
+            );
+        }
+        other => panic!("expected InsertHistoryCell error, got {other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "expected no follow-up events");
+    assert_eq!(chat.bottom_pane.composer_text(), expected_text);
+    assert_eq!(chat.bottom_pane.composer_local_image_paths(), local_images,);
+    assert_eq!(chat.remote_image_urls(), vec![remote_url]);
+    assert_eq!(chat.bottom_pane.take_mention_bindings(), mention_bindings);
+}
+
+#[tokio::test]
+async fn alt_s_ignores_key_when_modal_is_open() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.open_approvals_popup();
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
 }
 
 #[tokio::test]

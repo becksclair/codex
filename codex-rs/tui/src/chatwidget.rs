@@ -219,6 +219,10 @@ fn queued_message_edit_binding_for_terminal(terminal_name: TerminalName) -> KeyB
     }
 }
 
+fn supports_inline_view_image_preview(terminal_name: TerminalName) -> bool {
+    matches!(terminal_name, TerminalName::Ghostty | TerminalName::Kitty)
+}
+
 use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event::ExitMode;
@@ -713,6 +717,7 @@ pub(crate) struct ChatWidget {
     external_editor_state: ExternalEditorState,
     realtime_conversation: RealtimeConversationUiState,
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
+    supports_inline_view_image_preview: bool,
 }
 
 /// Snapshot of active-cell state that affects transcript overlay rendering.
@@ -2347,9 +2352,10 @@ impl ChatWidget {
 
     fn on_view_image_tool_call(&mut self, event: ViewImageToolCallEvent) {
         self.flush_answer_stream_with_separator();
-        self.add_to_history(history_cell::new_view_image_tool_call(
+        self.add_to_history(history_cell::new_view_image_tool_call_with_inline_preview(
             event.path,
             &self.config.cwd,
+            self.supports_inline_view_image_preview,
         ));
         self.request_redraw();
     }
@@ -3112,8 +3118,9 @@ impl ChatWidget {
         let active_cell = Some(Self::placeholder_session_header_cell(&config));
 
         let current_cwd = Some(config.cwd.clone());
-        let queued_message_edit_binding =
-            queued_message_edit_binding_for_terminal(terminal_info().name);
+        let terminal_name = terminal_info().name;
+        let queued_message_edit_binding = queued_message_edit_binding_for_terminal(terminal_name);
+        let supports_inline_view_image_preview = supports_inline_view_image_preview(terminal_name);
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -3206,6 +3213,7 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
+            supports_inline_view_image_preview,
         };
 
         widget.prefetch_rate_limits();
@@ -3295,8 +3303,9 @@ impl ChatWidget {
         let active_cell = Some(Self::placeholder_session_header_cell(&config));
         let current_cwd = Some(config.cwd.clone());
 
-        let queued_message_edit_binding =
-            queued_message_edit_binding_for_terminal(terminal_info().name);
+        let terminal_name = terminal_info().name;
+        let queued_message_edit_binding = queued_message_edit_binding_for_terminal(terminal_name);
+        let supports_inline_view_image_preview = supports_inline_view_image_preview(terminal_name);
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -3389,6 +3398,7 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
+            supports_inline_view_image_preview,
         };
 
         widget.prefetch_rate_limits();
@@ -3467,8 +3477,9 @@ impl ChatWidget {
             settings: fallback_default,
         };
 
-        let queued_message_edit_binding =
-            queued_message_edit_binding_for_terminal(terminal_info().name);
+        let terminal_name = terminal_info().name;
+        let queued_message_edit_binding = queued_message_edit_binding_for_terminal(terminal_name);
+        let supports_inline_view_image_preview = supports_inline_view_image_preview(terminal_name);
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -3561,6 +3572,7 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
+            supports_inline_view_image_preview,
         };
 
         widget.prefetch_rate_limits();
@@ -3624,7 +3636,46 @@ impl ChatWidget {
                 modifiers,
                 kind: KeyEventKind::Press,
                 ..
-            } if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            } if modifiers == KeyModifiers::CONTROL && c.eq_ignore_ascii_case(&'v') => {
+                match clipboard_text::read_text_from_clipboard() {
+                    Ok(text) => {
+                        self.handle_paste(text);
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::debug!("failed to read clipboard text for ctrl+v paste: {err}");
+                    }
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
+            } if modifiers.contains(KeyModifiers::ALT)
+                && !modifiers.contains(KeyModifiers::CONTROL)
+                && c.eq_ignore_ascii_case(&'s')
+                && self.bottom_pane.no_modal_or_popup_active() =>
+            {
+                if self.bottom_pane.is_task_running() {
+                    let message = format!(
+                        "'/{}' is disabled while a task is in progress.",
+                        SlashCommand::Resume.command()
+                    );
+                    self.add_to_history(history_cell::new_error_event(message));
+                    self.request_redraw();
+                } else {
+                    self.app_event_tx.send(AppEvent::OpenResumePicker);
+                }
+                return;
+            }
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
+            } if modifiers.contains(KeyModifiers::ALT)
+                && !modifiers.contains(KeyModifiers::CONTROL)
                 && c.eq_ignore_ascii_case(&'v') =>
             {
                 match paste_image_to_temp_png() {
