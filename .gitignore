@@ -67,8 +67,6 @@ coverage/
 
 # personal files
 personal/
-repomix-output.xml
-codex-rs/NOTES.md
 
 # os
 .DS_Store
