@@ -1,3 +1,4 @@
+mod auto_review;
 mod compact;
 mod ghost_snapshot;
 mod regular;
@@ -38,6 +39,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::user_input::UserInput;
 
+pub(crate) use auto_review::AutoReviewTask;
 pub(crate) use compact::CompactTask;
 pub(crate) use ghost_snapshot::GhostSnapshotTask;
 pub(crate) use regular::RegularTask;

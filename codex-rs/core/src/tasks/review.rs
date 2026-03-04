@@ -56,18 +56,13 @@ impl SessionTask for ReviewTask {
             .otel_manager
             .counter("codex.task.review", 1, &[]);
 
-        // Start sub-codex conversation and get the receiver for events.
-        let output = match start_review_conversation(
+        let output = run_review_delegate(
             session.clone(),
             ctx.clone(),
             input,
             cancellation_token.clone(),
         )
-        .await
-        {
-            Some(receiver) => process_review_events(session.clone(), ctx.clone(), receiver).await,
-            None => None,
-        };
+        .await;
         if !cancellation_token.is_cancelled() {
             exit_review_mode(session.clone_session(), output.clone(), ctx.clone()).await;
         }
@@ -76,6 +71,18 @@ impl SessionTask for ReviewTask {
 
     async fn abort(&self, session: Arc<SessionTaskContext>, ctx: Arc<TurnContext>) {
         exit_review_mode(session.clone_session(), None, ctx).await;
+    }
+}
+
+pub(crate) async fn run_review_delegate(
+    session: Arc<SessionTaskContext>,
+    ctx: Arc<TurnContext>,
+    input: Vec<UserInput>,
+    cancellation_token: CancellationToken,
+) -> Option<ReviewOutputEvent> {
+    match start_review_conversation(session.clone(), ctx.clone(), input, cancellation_token).await {
+        Some(receiver) => process_review_events(session, ctx, receiver).await,
+        None => None,
     }
 }
 
@@ -176,7 +183,7 @@ async fn process_review_events(
 /// Otherwise, attempt to extract the first JSON object substring and parse it.
 /// If parsing still fails, return a structured fallback carrying the plain text
 /// in `overall_explanation`.
-fn parse_review_output_event(text: &str) -> ReviewOutputEvent {
+pub(crate) fn parse_review_output_event(text: &str) -> ReviewOutputEvent {
     if let Ok(ev) = serde_json::from_str::<ReviewOutputEvent>(text) {
         return ev;
     }

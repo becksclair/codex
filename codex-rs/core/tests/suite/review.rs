@@ -4,6 +4,7 @@ use codex_core::config::Config;
 use codex_core::review_format::render_review_output_text;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AutoReviewRequest;
 use codex_protocol::protocol::ENVIRONMENT_CONTEXT_OPEN_TAG;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExitedReviewModeEvent;
@@ -25,12 +26,17 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
+use serial_test::serial;
+use std::env;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 use wiremock::MockServer;
+
+const CODEX_REVIEW_REASONING_EFFORT_ENV_VAR: &str = "CODEX_REVIEW_REASONING_EFFORT";
 
 /// Verify that submitting `Op::Review` spawns a child task and emits
 /// EnteredReviewMode -> ExitedReviewMode(None) -> TurnComplete
@@ -484,6 +490,377 @@ async fn review_uses_session_model_when_review_model_unset() {
     server.verify().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(review_reasoning_env)]
+async fn review_defaults_reasoning_effort_to_high_when_env_unset() {
+    skip_if_no_network!();
+    let _env_guard = EnvVarGuard::remove(CODEX_REVIEW_REASONING_EFFORT_ENV_VAR);
+
+    let sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |cfg| {
+        cfg.model = Some("gpt-5.3-codex".to_string());
+        cfg.review_model = None;
+    })
+    .await;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "default effort check".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = request_log.single_request();
+    assert_eq!(request.path(), "/v1/responses");
+    let body = request.body_json();
+    assert_eq!(body["model"].as_str().unwrap(), "gpt-5.3-codex");
+    assert_eq!(reasoning_effort_from_body(&body), Some("high"));
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(review_reasoning_env)]
+async fn review_invalid_env_reasoning_effort_warns_and_falls_back_to_high() {
+    skip_if_no_network!();
+    let _env_guard = EnvVarGuard::set(CODEX_REVIEW_REASONING_EFFORT_ENV_VAR, "banana");
+
+    let sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |cfg| {
+        cfg.model = Some("gpt-5.3-codex".to_string());
+        cfg.review_model = None;
+    })
+    .await;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "invalid effort check".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let warning = wait_for_event(&codex, |ev| {
+        matches!(
+            ev,
+            EventMsg::Warning(w) if w.message.contains(CODEX_REVIEW_REASONING_EFFORT_ENV_VAR)
+                && w.message.contains("invalid")
+        )
+    })
+    .await;
+    assert!(
+        matches!(warning, EventMsg::Warning(_)),
+        "expected warning event"
+    );
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = request_log.single_request();
+    assert_eq!(request.path(), "/v1/responses");
+    let body = request.body_json();
+    assert_eq!(reasoning_effort_from_body(&body), Some("high"));
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(review_reasoning_env)]
+async fn review_unsupported_env_reasoning_effort_uses_model_default() {
+    skip_if_no_network!();
+    let _env_guard = EnvVarGuard::set(CODEX_REVIEW_REASONING_EFFORT_ENV_VAR, "xhigh");
+
+    let sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |cfg| {
+        cfg.model = Some("gpt-5.3-codex".to_string());
+        cfg.review_model = Some("gpt-5.1".to_string());
+    })
+    .await;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "unsupported effort check".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let warning = wait_for_event(&codex, |ev| {
+        matches!(
+            ev,
+            EventMsg::Warning(w) if w.message.contains(CODEX_REVIEW_REASONING_EFFORT_ENV_VAR)
+                && w.message.contains("unsupported")
+        )
+    })
+    .await;
+    assert!(
+        matches!(warning, EventMsg::Warning(_)),
+        "expected warning event"
+    );
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = request_log.single_request();
+    assert_eq!(request.path(), "/v1/responses");
+    let body = request.body_json();
+    assert_eq!(body["model"].as_str().unwrap(), "gpt-5.1");
+    assert_eq!(reasoning_effort_from_body(&body), Some("medium"));
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(review_reasoning_env)]
+async fn review_unknown_model_with_unsupported_env_effort_leaves_effort_unset() {
+    skip_if_no_network!();
+    let _env_guard = EnvVarGuard::set(CODEX_REVIEW_REASONING_EFFORT_ENV_VAR, "xhigh");
+
+    let sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+    let (server, request_log) = start_responses_server_with_sse(sse_raw, 1).await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |cfg| {
+        cfg.model = Some("gpt-5.3-codex".to_string());
+        cfg.review_model = Some("model-that-does-not-exist".to_string());
+    })
+    .await;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "unknown model effort check".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let warning = wait_for_event(&codex, |ev| {
+        matches!(
+            ev,
+            EventMsg::Warning(w) if w.message.contains(CODEX_REVIEW_REASONING_EFFORT_ENV_VAR)
+                && w.message.contains("reasoning omitted")
+        )
+    })
+    .await;
+    assert!(
+        matches!(warning, EventMsg::Warning(_)),
+        "expected warning event"
+    );
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = request_log.single_request();
+    assert_eq!(request.path(), "/v1/responses");
+    let body = request.body_json();
+    assert_eq!(body["model"].as_str().unwrap(), "model-that-does-not-exist");
+    assert_eq!(reasoning_effort_from_body(&body), None);
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(review_reasoning_env)]
+async fn auto_review_uses_review_model_and_env_reasoning_effort_for_all_turns() {
+    skip_if_no_network!();
+    let _env_guard = EnvVarGuard::set(CODEX_REVIEW_REASONING_EFFORT_ENV_VAR, "low");
+
+    let review_json = serde_json::json!({
+        "findings": [
+            {
+                "title": "Fix me",
+                "body": "Need a fix pass.",
+                "confidence_score": 0.9,
+                "priority": 1,
+                "code_location": {
+                    "absolute_file_path": "/tmp/file.rs",
+                    "line_range": {"start": 10, "end": 10}
+                }
+            }
+        ],
+        "overall_correctness": "needs work",
+        "overall_explanation": "Please apply the fix.",
+        "overall_confidence_score": 0.9
+    })
+    .to_string();
+    let review_json_escaped = serde_json::to_string(&review_json).unwrap();
+    let review_sse_raw = format!(
+        r#"[
+            {{"type":"response.output_item.done", "item":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":{review_json_escaped}}}]}}}},
+            {{"type":"response.completed", "response": {{"id": "__ID__"}}}}
+        ]"#
+    );
+    let fix_sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+
+    let server = start_mock_server().await;
+    let review_sse =
+        load_sse_fixture_with_id_from_str(&review_sse_raw, &Uuid::new_v4().to_string());
+    let fix_sse = load_sse_fixture_with_id_from_str(fix_sse_raw, &Uuid::new_v4().to_string());
+    let request_log = mount_sse_sequence(&server, vec![review_sse, fix_sse]).await;
+
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |cfg| {
+        cfg.model = Some("gpt-5.3-codex".to_string());
+        cfg.review_model = Some("gpt-5.1".to_string());
+    })
+    .await;
+
+    codex
+        .submit(Op::AutoReview {
+            request: AutoReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "run auto-review once".to_string(),
+                },
+                max_iterations: Some(1),
+                max_findings_per_iteration: Some(1),
+                stagnation_rounds: Some(1),
+                validation_commands: None,
+                prompt_for_sensitive_findings: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(request.path(), "/v1/responses");
+        let body = request.body_json();
+        assert_eq!(body["model"].as_str().unwrap(), "gpt-5.1");
+        assert_eq!(reasoning_effort_from_body(&body), Some("low"));
+    }
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(review_reasoning_env)]
+async fn auto_review_uses_custom_auto_fix_prompt_from_config() {
+    skip_if_no_network!();
+
+    let review_json = serde_json::json!({
+        "findings": [
+            {
+                "title": "Fix me",
+                "body": "Need a fix pass.",
+                "confidence_score": 0.9,
+                "priority": 1,
+                "code_location": {
+                    "absolute_file_path": "/tmp/file.rs",
+                    "line_range": {"start": 10, "end": 10}
+                }
+            }
+        ],
+        "overall_correctness": "needs work",
+        "overall_explanation": "Please apply the fix.",
+        "overall_confidence_score": 0.9
+    })
+    .to_string();
+    let review_json_escaped = serde_json::to_string(&review_json).unwrap();
+    let review_sse_raw = format!(
+        r#"[
+            {{"type":"response.output_item.done", "item":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":{review_json_escaped}}}]}}}},
+            {{"type":"response.completed", "response": {{"id": "__ID__"}}}}
+        ]"#
+    );
+    let fix_sse_raw = r#"[
+        {"type":"response.completed", "response": {"id": "__ID__"}}
+    ]"#;
+
+    let server = start_mock_server().await;
+    let review_sse =
+        load_sse_fixture_with_id_from_str(&review_sse_raw, &Uuid::new_v4().to_string());
+    let fix_sse = load_sse_fixture_with_id_from_str(fix_sse_raw, &Uuid::new_v4().to_string());
+    let request_log = mount_sse_sequence(&server, vec![review_sse, fix_sse]).await;
+
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let custom_fix_prompt = "Use this exact custom fix prompt.";
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |cfg| {
+        cfg.auto_fix_prompt = Some(custom_fix_prompt.to_string());
+    })
+    .await;
+
+    codex
+        .submit(Op::AutoReview {
+            request: AutoReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "run auto-review once".to_string(),
+                },
+                max_iterations: Some(1),
+                max_findings_per_iteration: Some(1),
+                stagnation_rounds: Some(1),
+                validation_commands: None,
+                prompt_for_sensitive_findings: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let _entered = wait_for_event(&codex, |ev| matches!(ev, EventMsg::EnteredReviewMode(_))).await;
+    let _closed = wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExitedReviewMode(_))).await;
+    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 2);
+    let fix_request = &requests[1];
+    let user_texts = fix_request.message_input_texts("user");
+    let matching_prompt = user_texts
+        .iter()
+        .find(|text| text.starts_with(custom_fix_prompt))
+        .expect("custom fix prompt with mandatory footer");
+    assert!(matching_prompt.contains("Execution constraints (mandatory):"));
+    assert!(matching_prompt.contains("Findings:"));
+    assert!(matching_prompt.contains("validation commands"));
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
 /// When a review session begins, it must not prepend prior chat history from
 /// the parent session. The request `input` should contain only the review
 /// prompt from the user.
@@ -871,6 +1248,50 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
 
     let _codex_home_guard = codex_home;
     server.verify().await;
+}
+
+fn reasoning_effort_from_body(body: &serde_json::Value) -> Option<&str> {
+    body.get("reasoning")
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(|effort| effort.as_str())
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = env::var_os(key);
+        // SAFETY: tests in this file that mutate the same env var are serialized.
+        unsafe {
+            env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let original = env::var_os(key);
+        // SAFETY: tests in this file that mutate the same env var are serialized.
+        unsafe {
+            env::remove_var(key);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: tests in this file that mutate the same env var are serialized.
+        unsafe {
+            if let Some(value) = self.original.as_ref() {
+                env::set_var(self.key, value);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
 }
 
 /// Start a mock Responses API server and mount the given SSE stream body.

@@ -3129,6 +3129,15 @@ impl App {
             AppEvent::OpenReviewCustomPrompt => {
                 self.chat_widget.show_review_custom_prompt();
             }
+            AppEvent::OpenAutoReviewBranchPicker(cwd) => {
+                self.chat_widget.show_auto_review_branch_picker(&cwd).await;
+            }
+            AppEvent::StartAutoReviewStaged(cwd) => {
+                self.chat_widget.start_auto_review_staged(&cwd).await;
+            }
+            AppEvent::OpenAutoReviewCustomPrompt => {
+                self.chat_widget.show_auto_review_custom_prompt();
+            }
             AppEvent::SubmitUserMessageWithMode {
                 text,
                 collaboration_mode,

@@ -413,6 +413,15 @@ pub(crate) enum AppEvent {
     /// Open the custom prompt option from the review popup.
     OpenReviewCustomPrompt,
 
+    /// Open the branch picker option from the auto-review popup.
+    OpenAutoReviewBranchPicker(PathBuf),
+
+    /// Start auto-review with staged-changes scope.
+    StartAutoReviewStaged(PathBuf),
+
+    /// Open the custom prompt option from the auto-review popup.
+    OpenAutoReviewCustomPrompt,
+
     /// Submit a user message with an explicit collaboration mask.
     SubmitUserMessageWithMode {
         text: String,

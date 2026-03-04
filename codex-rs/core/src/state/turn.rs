@@ -37,6 +37,7 @@ impl Default for ActiveTurn {
 pub(crate) enum TaskKind {
     Regular,
     Review,
+    AutoReview,
     Compact,
 }
 

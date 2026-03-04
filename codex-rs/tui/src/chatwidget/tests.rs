@@ -58,6 +58,7 @@ use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AgentReasoningDeltaEvent;
 use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
+use codex_protocol::protocol::AutoReviewRequest;
 use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CreditsSnapshot;
@@ -4900,6 +4901,84 @@ async fn review_popup_custom_prompt_action_sends_event() {
 }
 
 #[tokio::test]
+async fn slash_auto_review_opens_selector_in_git_repo_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let tempdir = tempdir().expect("tempdir");
+    std::fs::create_dir(tempdir.path().join(".git")).expect("create .git marker");
+    chat.config.cwd = tempdir.path().to_path_buf();
+
+    chat.dispatch_command(SlashCommand::AutoReview);
+
+    let popup = render_bottom_popup(&chat, 80);
+    assert_snapshot!("auto_review_selection_popup", popup);
+}
+
+#[tokio::test]
+async fn slash_auto_review_without_git_opens_selector() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    let tempdir = tempdir().expect("tempdir");
+    chat.config.cwd = tempdir.path().to_path_buf();
+
+    chat.dispatch_command(SlashCommand::AutoReview);
+
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(
+        popup.contains("Select an auto-review preset"),
+        "expected auto-review preset popup, got: {popup:?}"
+    );
+}
+
+#[tokio::test]
+async fn auto_review_staged_without_staged_changes_falls_back_to_uncommitted() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    let tempdir = tempdir().expect("tempdir");
+    let git_init_status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(tempdir.path())
+        .status()
+        .expect("run git init");
+    assert!(git_init_status.success(), "git init should succeed");
+
+    chat.start_auto_review_staged(tempdir.path()).await;
+
+    match op_rx.try_recv() {
+        Ok(Op::AutoReview { request }) => {
+            assert_eq!(request, ChatWidget::uncommitted_auto_review_request());
+        }
+        other => panic!("expected auto-review op, got {other:?}"),
+    }
+
+    let rendered_messages = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(
+        rendered_messages.contains(AUTO_REVIEW_STAGED_FALLBACK_MESSAGE),
+        "expected staged fallback message, got: {rendered_messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn auto_review_staged_probe_failure_shows_message_and_does_not_start() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    let tempdir = tempdir().expect("tempdir");
+
+    chat.start_auto_review_staged(tempdir.path()).await;
+
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+
+    let rendered_messages = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(
+        rendered_messages.contains(AUTO_REVIEW_STAGED_PROBE_FAILED_MESSAGE),
+        "expected staged probe failure message, got: {rendered_messages:?}"
+    );
+}
+
+#[tokio::test]
 async fn slash_init_skips_when_project_doc_exists() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
     let tempdir = tempdir().unwrap();
@@ -5873,6 +5952,72 @@ async fn custom_prompt_enter_empty_does_not_send() {
 
     // No AppEvent::CodexOp should be sent
     assert!(rx.try_recv().is_err(), "no app event should be sent");
+}
+
+#[tokio::test]
+async fn auto_review_custom_prompt_submit_sends_auto_review_op() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.show_auto_review_custom_prompt();
+    chat.handle_paste("  inspect architecture hotspots  ".to_string());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let evt = rx.try_recv().expect("expected one app event");
+    match evt {
+        AppEvent::CodexOp(Op::AutoReview { request }) => {
+            assert_eq!(
+                request,
+                AutoReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: "inspect architecture hotspots".to_string(),
+                    },
+                    max_iterations: None,
+                    max_findings_per_iteration: None,
+                    stagnation_rounds: None,
+                    validation_commands: None,
+                    prompt_for_sensitive_findings: Some(true),
+                }
+            );
+        }
+        other => panic!("unexpected app event: {other:?}"),
+    }
+}
+
+#[test]
+fn auto_review_request_for_staged_scope_switches_target_by_staged_presence() {
+    assert_eq!(
+        ChatWidget::auto_review_request_for_staged_scope(true),
+        ChatWidget::staged_auto_review_request()
+    );
+    assert_eq!(
+        ChatWidget::auto_review_request_for_staged_scope(false),
+        ChatWidget::uncommitted_auto_review_request()
+    );
+}
+
+#[test]
+fn staged_auto_review_request_validates_cached_and_unstaged_diffs() {
+    let request = ChatWidget::staged_auto_review_request();
+    assert_eq!(
+        request.validation_commands,
+        Some(vec![
+            "git diff --cached --check".to_string(),
+            "git diff --check".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn auto_review_base_branch_options_excludes_current_branch() {
+    let options = ChatWidget::auto_review_base_branch_options(
+        vec![
+            "main".to_string(),
+            "feature/a".to_string(),
+            "feature/b".to_string(),
+        ],
+        "feature/a",
+    );
+    assert_eq!(options, vec!["main".to_string(), "feature/b".to_string()]);
 }
 
 #[tokio::test]

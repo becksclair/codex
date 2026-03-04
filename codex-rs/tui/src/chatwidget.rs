@@ -31,6 +31,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -68,6 +69,8 @@ use codex_core::mcp::McpManager;
 use codex_core::models_manager::manager::ModelsManager;
 use codex_core::plugins::PluginsManager;
 use codex_core::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
+use codex_core::review_prompts::AUTO_REVIEW_ALL_PROJECT_PROMPT;
+use codex_core::review_prompts::AUTO_REVIEW_STAGED_PROMPT;
 use codex_core::skills::model::SkillMetadata;
 use codex_core::terminal::TerminalName;
 use codex_core::terminal::terminal_info;
@@ -98,6 +101,7 @@ use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
+use codex_protocol::protocol::AutoReviewRequest;
 use codex_protocol::protocol::BackgroundEventEvent;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::CreditsSnapshot;
@@ -157,6 +161,7 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
+use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -175,6 +180,12 @@ const PLAN_MODE_REASONING_SCOPE_TITLE: &str = "Apply reasoning change";
 const PLAN_MODE_REASONING_SCOPE_PLAN_ONLY: &str = "Apply to Plan mode override";
 const PLAN_MODE_REASONING_SCOPE_ALL_MODES: &str = "Apply to global default and Plan mode override";
 const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
+const AUTO_REVIEW_STAGED_FALLBACK_MESSAGE: &str =
+    "No staged changes detected. Falling back to uncommitted changes.";
+const AUTO_REVIEW_STAGED_PROBE_FAILED_MESSAGE: &str =
+    "Unable to determine staged changes. Auto-review was not started.";
+const AUTO_REVIEW_NO_BASE_BRANCH_OPTIONS_MESSAGE: &str =
+    "No other local branches are available for base-branch auto-review.";
 
 /// Choose the keybinding used to edit the most-recently queued message.
 ///
@@ -3792,6 +3803,9 @@ impl ChatWidget {
             SlashCommand::Review => {
                 self.open_review_popup();
             }
+            SlashCommand::AutoReview => {
+                self.open_auto_review_popup();
+            }
             SlashCommand::Rename => {
                 self.otel_manager.counter("codex.thread.rename", 1, &[]);
                 self.show_rename_prompt();
@@ -4168,6 +4182,26 @@ impl ChatWidget {
                             instructions: prepared_args,
                         },
                         user_facing_hint: None,
+                    },
+                });
+                self.bottom_pane.drain_pending_submission_state();
+            }
+            SlashCommand::AutoReview if !trimmed.is_empty() => {
+                let Some((prepared_args, _prepared_elements)) =
+                    self.bottom_pane.prepare_inline_args_submission(false)
+                else {
+                    return;
+                };
+                self.submit_op(Op::AutoReview {
+                    request: AutoReviewRequest {
+                        target: ReviewTarget::Custom {
+                            instructions: prepared_args,
+                        },
+                        max_iterations: None,
+                        max_findings_per_iteration: None,
+                        stagnation_rounds: None,
+                        validation_commands: None,
+                        prompt_for_sensitive_findings: Some(true),
                     },
                 });
                 self.bottom_pane.drain_pending_submission_state();
@@ -7978,7 +8012,9 @@ impl ChatWidget {
     pub(crate) fn submit_op(&mut self, op: Op) -> bool {
         // Record outbound operation for session replay fidelity.
         crate::session_log::log_outbound_op(&op);
-        if matches!(&op, Op::Review { .. }) && !self.bottom_pane.is_task_running() {
+        if matches!(&op, Op::Review { .. } | Op::AutoReview { .. })
+            && !self.bottom_pane.is_task_running()
+        {
             self.bottom_pane.set_task_running(true);
         }
         if let Err(e) = self.codex_op_tx.send(op) {
@@ -8090,6 +8126,86 @@ impl ChatWidget {
         self.bottom_pane.set_connectors_snapshot(Some(snapshot));
     }
 
+    fn submit_auto_review_request(&mut self, request: AutoReviewRequest) {
+        self.submit_op(Op::AutoReview { request });
+    }
+
+    fn uncommitted_auto_review_request() -> AutoReviewRequest {
+        AutoReviewRequest {
+            target: ReviewTarget::UncommittedChanges,
+            max_iterations: None,
+            max_findings_per_iteration: None,
+            stagnation_rounds: None,
+            validation_commands: None,
+            prompt_for_sensitive_findings: Some(true),
+        }
+    }
+
+    fn staged_auto_review_request() -> AutoReviewRequest {
+        AutoReviewRequest {
+            target: ReviewTarget::Custom {
+                instructions: AUTO_REVIEW_STAGED_PROMPT.to_string(),
+            },
+            max_iterations: None,
+            max_findings_per_iteration: None,
+            stagnation_rounds: None,
+            validation_commands: Some(vec![
+                "git diff --cached --check".to_string(),
+                "git diff --check".to_string(),
+            ]),
+            prompt_for_sensitive_findings: Some(true),
+        }
+    }
+
+    fn all_project_auto_review_request() -> AutoReviewRequest {
+        AutoReviewRequest {
+            target: ReviewTarget::Custom {
+                instructions: AUTO_REVIEW_ALL_PROJECT_PROMPT.to_string(),
+            },
+            max_iterations: None,
+            max_findings_per_iteration: None,
+            stagnation_rounds: None,
+            validation_commands: None,
+            prompt_for_sensitive_findings: Some(true),
+        }
+    }
+
+    fn auto_review_request_for_staged_scope(has_staged_changes: bool) -> AutoReviewRequest {
+        if has_staged_changes {
+            Self::staged_auto_review_request()
+        } else {
+            Self::uncommitted_auto_review_request()
+        }
+    }
+
+    fn auto_review_base_branch_options(branches: Vec<String>, current_branch: &str) -> Vec<String> {
+        branches
+            .into_iter()
+            .filter(|branch| branch != current_branch)
+            .collect()
+    }
+
+    async fn has_staged_changes(cwd: &Path) -> Option<bool> {
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new("git")
+                .args(["diff", "--cached", "--name-only"])
+                .current_dir(cwd)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+
+        match output {
+            Ok(Ok(output)) if output.status.success() => {
+                Some(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+            }
+            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
     pub(crate) fn open_review_popup(&mut self) {
         let mut items: Vec<SelectionItem> = Vec::new();
 
@@ -8150,6 +8266,73 @@ impl ChatWidget {
         });
     }
 
+    pub(crate) fn open_auto_review_popup(&mut self) {
+        let mut items: Vec<SelectionItem> = Vec::new();
+
+        items.push(SelectionItem {
+            name: "Review uncommitted changes".to_string(),
+            actions: vec![Box::new(move |tx: &AppEventSender| {
+                tx.send(AppEvent::CodexOp(Op::AutoReview {
+                    request: Self::uncommitted_auto_review_request(),
+                }));
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        items.push(SelectionItem {
+            name: "Review staged changes".to_string(),
+            actions: vec![Box::new({
+                let cwd = self.config.cwd.clone();
+                move |tx| {
+                    tx.send(AppEvent::StartAutoReviewStaged(cwd.clone()));
+                }
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        items.push(SelectionItem {
+            name: "Review against a base branch".to_string(),
+            description: Some("(PR Style)".into()),
+            actions: vec![Box::new({
+                let cwd = self.config.cwd.clone();
+                move |tx| {
+                    tx.send(AppEvent::OpenAutoReviewBranchPicker(cwd.clone()));
+                }
+            })],
+            dismiss_on_select: false,
+            ..Default::default()
+        });
+
+        items.push(SelectionItem {
+            name: "Review all project files".to_string(),
+            actions: vec![Box::new(move |tx: &AppEventSender| {
+                tx.send(AppEvent::CodexOp(Op::AutoReview {
+                    request: Self::all_project_auto_review_request(),
+                }));
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        items.push(SelectionItem {
+            name: "Custom auto-review instructions".to_string(),
+            actions: vec![Box::new(move |tx| {
+                tx.send(AppEvent::OpenAutoReviewCustomPrompt);
+            })],
+            dismiss_on_select: false,
+            ..Default::default()
+        });
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Select an auto-review preset".into()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
     pub(crate) async fn show_review_branch_picker(&mut self, cwd: &Path) {
         let branches = local_git_branches(cwd).await;
         let current_branch = current_branch_name(cwd)
@@ -8185,6 +8368,65 @@ impl ChatWidget {
             search_placeholder: Some("Type to search branches".to_string()),
             ..Default::default()
         });
+    }
+
+    pub(crate) async fn show_auto_review_branch_picker(&mut self, cwd: &Path) {
+        let branches = local_git_branches(cwd).await;
+        let current_branch = current_branch_name(cwd)
+            .await
+            .unwrap_or_else(|| "(detached HEAD)".to_string());
+        let filtered = Self::auto_review_base_branch_options(branches, current_branch.as_str());
+        if filtered.is_empty() {
+            self.add_info_message(AUTO_REVIEW_NO_BASE_BRANCH_OPTIONS_MESSAGE.to_string(), None);
+            return;
+        }
+
+        let mut items: Vec<SelectionItem> = Vec::with_capacity(filtered.len());
+        for option in filtered {
+            let branch = option.clone();
+            items.push(SelectionItem {
+                name: format!("{current_branch} -> {branch}"),
+                actions: vec![Box::new(move |tx3: &AppEventSender| {
+                    tx3.send(AppEvent::CodexOp(Op::AutoReview {
+                        request: AutoReviewRequest {
+                            target: ReviewTarget::BaseBranch {
+                                branch: branch.clone(),
+                            },
+                            max_iterations: None,
+                            max_findings_per_iteration: None,
+                            stagnation_rounds: None,
+                            validation_commands: None,
+                            prompt_for_sensitive_findings: Some(true),
+                        },
+                    }));
+                })],
+                dismiss_on_select: true,
+                search_value: Some(option),
+                ..Default::default()
+            });
+        }
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Select a base branch for auto-review".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            is_searchable: true,
+            search_placeholder: Some("Type to search branches".to_string()),
+            ..Default::default()
+        });
+    }
+
+    pub(crate) async fn start_auto_review_staged(&mut self, cwd: &Path) {
+        let Some(has_staged_changes) = Self::has_staged_changes(cwd).await else {
+            self.add_info_message(AUTO_REVIEW_STAGED_PROBE_FAILED_MESSAGE.to_string(), None);
+            return;
+        };
+        if !has_staged_changes {
+            self.add_info_message(AUTO_REVIEW_STAGED_FALLBACK_MESSAGE.to_string(), None);
+        }
+        self.submit_auto_review_request(Self::auto_review_request_for_staged_scope(
+            has_staged_changes,
+        ));
     }
 
     pub(crate) async fn show_review_commit_picker(&mut self, cwd: &Path) {
@@ -8242,6 +8484,34 @@ impl ChatWidget {
                             instructions: trimmed,
                         },
                         user_facing_hint: None,
+                    },
+                }));
+            }),
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
+    pub(crate) fn show_auto_review_custom_prompt(&mut self) {
+        let tx = self.app_event_tx.clone();
+        let view = CustomPromptView::new(
+            "Custom auto-review instructions".to_string(),
+            "Type instructions and press Enter".to_string(),
+            None,
+            Box::new(move |prompt: String| {
+                let trimmed = prompt.trim().to_string();
+                if trimmed.is_empty() {
+                    return;
+                }
+                tx.send(AppEvent::CodexOp(Op::AutoReview {
+                    request: AutoReviewRequest {
+                        target: ReviewTarget::Custom {
+                            instructions: trimmed,
+                        },
+                        max_iterations: None,
+                        max_findings_per_iteration: None,
+                        stagnation_rounds: None,
+                        validation_commands: None,
+                        prompt_for_sensitive_findings: Some(true),
                     },
                 }));
             }),

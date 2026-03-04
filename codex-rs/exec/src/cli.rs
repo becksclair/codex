@@ -121,6 +121,9 @@ pub enum Command {
 
     /// Run a code review against the current repository.
     Review(ReviewArgs),
+
+    /// Run an iterative review + fix cycle against the current repository.
+    AutoReview(AutoReviewArgs),
 }
 
 #[derive(Args, Debug)]
@@ -247,6 +250,61 @@ pub struct ReviewArgs {
     /// Custom review instructions. If `-` is used, read from stdin.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct AutoReviewArgs {
+    /// Review staged, unstaged, and untracked changes.
+    #[arg(
+        long = "uncommitted",
+        default_value_t = false,
+        conflicts_with_all = ["base", "commit", "prompt"]
+    )]
+    pub uncommitted: bool,
+
+    /// Review changes against the given base branch.
+    #[arg(
+        long = "base",
+        value_name = "BRANCH",
+        conflicts_with_all = ["uncommitted", "commit", "prompt"]
+    )]
+    pub base: Option<String>,
+
+    /// Review the changes introduced by a commit.
+    #[arg(
+        long = "commit",
+        value_name = "SHA",
+        conflicts_with_all = ["uncommitted", "base", "prompt"]
+    )]
+    pub commit: Option<String>,
+
+    /// Optional commit title to display in the review summary.
+    #[arg(long = "title", value_name = "TITLE", requires = "commit")]
+    pub commit_title: Option<String>,
+
+    /// Custom review instructions. If `-` is used, read from stdin.
+    #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
+    pub prompt: Option<String>,
+
+    /// Maximum number of review/fix iterations before stopping.
+    #[arg(
+        long = "max-iterations",
+        default_value_t = 20,
+        value_parser = clap::value_parser!(u8).range(1..=20)
+    )]
+    pub max_iterations: u8,
+
+    /// Maximum number of findings to address per iteration.
+    #[arg(long = "max-findings", default_value_t = 50)]
+    pub max_findings_per_iteration: u16,
+
+    /// Number of unchanged-review rounds tolerated before stopping.
+    #[arg(long = "stagnation-rounds", default_value_t = 2)]
+    pub stagnation_rounds: u8,
+
+    /// Additional validation command to run after each fix iteration.
+    #[arg(long = "validate-cmd", value_name = "CMD")]
+    pub validation_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]

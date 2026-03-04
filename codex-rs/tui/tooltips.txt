@@ -4,6 +4,7 @@ Use /feedback to send logs to the maintainers when something looks off.
 Switch models or reasoning effort quickly with /model.
 Use /permissions to control when Codex asks for confirmation.
 Run /review to get a code review of your current changes.
+Run /auto-review to iterate review + fixes with stop guards.
 Use /skills to list available skills or ask Codex to use one.
 Use /status to see the current model, approvals, and token usage.
 Use /statusline to configure which items appear in the status line.

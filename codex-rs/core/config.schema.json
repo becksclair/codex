@@ -1636,6 +1636,10 @@
       "default": null,
       "description": "Machine-local realtime audio device preferences used by realtime voice."
     },
+    "auto_fix_prompt": {
+      "description": "Optional override for the auto-review fix prompt shown after findings are found.",
+      "type": "string"
+    },
     "background_terminal_max_timeout": {
       "description": "Maximum poll window for background terminal output (`write_stdin`), in milliseconds. Default: `300000` (5 minutes).",
       "format": "uint64",

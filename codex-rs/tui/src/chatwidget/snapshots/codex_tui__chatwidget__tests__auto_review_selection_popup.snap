@@ -1,0 +1,14 @@
+---
+source: tui/src/chatwidget/tests.rs
+assertion_line: 4235
+expression: popup
+---
+  Select an auto-review preset
+
+› 1. Review uncommitted changes
+  2. Review staged changes
+  3. Review against a base branch     (PR Style)
+  4. Review all project files
+  5. Custom auto-review instructions
+
+  Press enter to confirm or esc to go back

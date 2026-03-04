@@ -152,11 +152,9 @@ pub async fn load_default_config_for_test(codex_home: &TempDir) -> Config {
 
 #[cfg(target_os = "linux")]
 fn default_test_overrides() -> ConfigOverrides {
+    let codex_linux_sandbox_exe = codex_utils_cargo_bin::cargo_bin("codex-linux-sandbox").ok();
     ConfigOverrides {
-        codex_linux_sandbox_exe: Some(
-            codex_utils_cargo_bin::cargo_bin("codex-linux-sandbox")
-                .expect("should find binary for codex-linux-sandbox"),
-        ),
+        codex_linux_sandbox_exe,
         ..ConfigOverrides::default()
     }
 }

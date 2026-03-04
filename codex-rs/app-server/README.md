@@ -143,6 +143,7 @@ Example with notification opt-out:
 - `thread/realtime/appendText` — append text input to the active realtime session (experimental); returns `{}`.
 - `thread/realtime/stop` — stop the active realtime session for the thread (experimental); returns `{}`.
 - `review/start` — kick off Codex’s automated reviewer for a thread; responds like `turn/start` and emits `item/started`/`item/completed` notifications with `enteredReviewMode` and `exitedReviewMode` items, plus a final assistant `agentMessage` containing the review.
+- `autoReview/start` — run a bounded iterative review + fix cycle for a thread, with optional iteration and validation controls.
 - `command/exec` — run a single command under the server sandbox without starting a thread/turn (handy for utilities and validation).
 - `model/list` — list available models (set `includeHidden: true` to include entries with `hidden: true`), with reasoning effort options, optional legacy `upgrade` model ids, optional `upgradeInfo` metadata (`model`, `upgradeCopy`, `modelLink`, `migrationMarkdown`), and optional `availabilityNux` metadata.
 - `experimentalFeature/list` — list feature flags with stage metadata (`beta`, `underDevelopment`, `stable`, etc.), enabled/default-enabled state, and cursor pagination. For non-beta flags, `displayName`/`description`/`announcement` are `null`.
@@ -530,6 +531,13 @@ Use `review/start` to run Codex’s reviewer on the currently checked-out projec
   - `"inline"`: run the review as a new turn on the existing thread. The response’s `reviewThreadId` equals the original `threadId`, and no new `thread/started` notification is emitted.
   - `"detached"`: fork a new review thread from the parent conversation and run the review there. The response’s `reviewThreadId` is the id of this new review thread, and the server emits a `thread/started` notification for it before streaming review items.
 
+Review model/effort behavior:
+
+- If `review_model` is set in config, review and auto-review use that model.
+- Review effort uses `CODEX_REVIEW_REASONING_EFFORT` when set (`none|minimal|low|medium|high|xhigh`).
+- If the env value is missing or invalid, review effort defaults to `high`.
+- If the requested effort is unsupported by the selected review model, Codex falls back to that model's default effort (or leaves effort unset if the model advertises no reasoning levels/default).
+
 Example request/response:
 
 ```json
@@ -586,6 +594,49 @@ containing an `exitedReviewMode` item with the final review text:
 ```
 
 The `review` string is plain text that already bundles the overall explanation plus a bullet list for each structured finding (matching `ThreadItem::ExitedReviewMode` in the generated schema). Use this notification to render the reviewer output in your client.
+
+### Example: Start iterative auto-review
+
+Use `autoReview/start` to run a bounded review + fix loop on a thread. This endpoint accepts the same `target` and `delivery` values as `review/start`, plus optional loop controls:
+
+- `maxIterations` (default `20`)
+- `maxFindingsPerIteration` (default `50`)
+- `stagnationRounds` (default `2`)
+- `validationCommands` (optional additional shell commands the fixer should run after each fix iteration)
+- `promptForSensitiveFindings` (optional; ask for confirmation when findings include security/auth or behavior-changing concerns)
+
+Behavior notes:
+
+- Diff-scoped review + fix turns use an efficiency strategy: one manifest pass, grouped file inspection, bounded fanout, and command dedupe before broader probing.
+- For custom `auto_fix_prompt` configuration, Codex preserves the custom body but appends a mandatory execution footer containing scoped findings and validation requirements.
+
+Example request/response:
+
+```json
+{ "method": "autoReview/start", "id": 41, "params": {
+    "threadId": "thr_123",
+    "delivery": "inline",
+    "target": { "type": "uncommittedChanges" },
+    "maxIterations": 20,
+    "maxFindingsPerIteration": 50,
+    "stagnationRounds": 2,
+    "validationCommands": ["cargo test -p codex-core"],
+    "promptForSensitiveFindings": true
+} }
+{ "id": 41, "result": {
+    "turn": {
+      "id": "turn_901",
+      "status": "inProgress",
+      "items": [
+        { "type": "userMessage", "id": "turn_901", "content": [ { "type": "text", "text": "current changes" } ] }
+      ],
+      "error": null
+    },
+    "reviewThreadId": "thr_123"
+} }
+```
+
+Detached delivery (`"delivery": "detached"`) behaves like `review/start`: the server forks a new thread, emits `thread/started` for it, and returns that id in `reviewThreadId`.
 
 ### Example: One-off command execution
 

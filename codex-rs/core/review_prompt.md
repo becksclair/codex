@@ -53,6 +53,20 @@ At the end of your findings, output an "overall correctness" verdict of whether 
 Correct implies that existing code and tests will not break, and the patch is free of bugs and other blocking issues.
 Ignore non-blocking issues such as style, formatting, typos, documentation, and other nits.
 
+SCOPE AND COMMAND EFFICIENCY:
+
+- For diff-scoped review modes, start with lightweight scope discovery (`--name-only`, `--stat`) and then inspect candidate files with path-scoped commands.
+- Do not dump broad unscoped raw diffs by default when a scoped command can answer the question.
+- Avoid rerunning identical expensive commands when prior turn output is still valid.
+- Use grouped, feature-cohesive inspection when possible: inspect related files together before splitting into one-file probes.
+- Prefer finding-led order: inspect highest-priority/highest-confidence candidate groups first.
+- Use bounded fanout for grouped inspections (max 6 groups, max 10 files per group).
+- Keep discovery and inspection within a soft shell-command budget of 16 commands; if scoped evidence is still insufficient, allow at most one broader follow-up command.
+- If tool-level parallel calls are supported, run grouped inspections in parallel; otherwise preserve grouped order and run serially.
+- For staged-only scopes, avoid unstaged probes until staged evidence is exhausted.
+- For untracked files missing from path-scoped diff output, read file contents directly instead of retrying identical diff commands.
+- Full-project mode exception: when the review request explicitly asks to review the whole project (not only pending diffs), findings may reference files outside the current pending diff.
+
 FORMATTING GUIDELINES:
 The finding description should be one paragraph.
 

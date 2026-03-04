@@ -2995,12 +2995,49 @@ pub struct ReviewStartParams {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub struct AutoReviewStartParams {
+    pub thread_id: String,
+    pub target: ReviewTarget,
+
+    /// Where to run auto-review: inline (default) on the current thread or
+    /// detached on a new thread (returned in `reviewThreadId`).
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub delivery: Option<ReviewDelivery>,
+
+    #[ts(optional = nullable)]
+    pub max_iterations: Option<u8>,
+    #[ts(optional = nullable)]
+    pub max_findings_per_iteration: Option<u16>,
+    #[ts(optional = nullable)]
+    pub stagnation_rounds: Option<u8>,
+    #[ts(optional = nullable)]
+    pub validation_commands: Option<Vec<String>>,
+    #[ts(optional = nullable)]
+    pub prompt_for_sensitive_findings: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct ReviewStartResponse {
     pub turn: Turn,
     /// Identifies the thread where the review runs.
     ///
     /// For inline reviews, this is the original thread id.
     /// For detached reviews, this is the id of the new review thread.
+    pub review_thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AutoReviewStartResponse {
+    pub turn: Turn,
+    /// Identifies the thread where auto-review runs.
+    ///
+    /// For inline runs, this is the original thread id.
+    /// For detached runs, this is the id of the new review thread.
     pub review_thread_id: String,
 }
 

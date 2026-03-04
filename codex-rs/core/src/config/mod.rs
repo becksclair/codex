@@ -195,6 +195,9 @@ pub struct Config {
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
 
+    /// Optional override for the auto-review fix prompt.
+    pub auto_fix_prompt: Option<String>,
+
     /// Size of the context window for the model, in tokens.
     pub model_context_window: Option<i64>,
 
@@ -1015,6 +1018,8 @@ pub struct ConfigToml {
     pub model: Option<String>,
     /// Review model override used by the `/review` feature.
     pub review_model: Option<String>,
+    /// Optional override for the auto-review fix prompt shown after findings are found.
+    pub auto_fix_prompt: Option<String>,
 
     /// Provider to use from the model_providers map.
     pub model_provider: Option<String>,
@@ -2033,6 +2038,10 @@ impl Config {
             None => base_instructions,
         };
         let developer_instructions = developer_instructions.or(cfg.developer_instructions);
+        let auto_fix_prompt = cfg.auto_fix_prompt.as_ref().and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then_some(trimmed.to_string())
+        });
         let personality = personality
             .or(config_profile.personality)
             .or(cfg.personality)
@@ -2174,6 +2183,7 @@ impl Config {
             model,
             service_tier,
             review_model,
+            auto_fix_prompt,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
             model_provider_id,
@@ -2777,6 +2787,32 @@ allowed_domains = ["openai.com"]
                 allow_local_binding: None,
             }
         );
+    }
+
+    #[test]
+    fn config_toml_deserializes_auto_fix_prompt() {
+        let parsed: ConfigToml = toml::from_str(
+            r#"
+auto_fix_prompt = "Use this configured prompt."
+"#,
+        )
+        .expect("TOML deserialization should succeed");
+
+        assert_eq!(
+            parsed.auto_fix_prompt.as_deref(),
+            Some("Use this configured prompt."),
+        );
+    }
+
+    #[test]
+    fn config_toml_ignores_auto_review_prompt_key() {
+        let parsed = toml::from_str::<ConfigToml>(
+            r#"
+auto_review_prompt = "Old key should not be accepted."
+"#,
+        )
+        .expect("TOML deserialization should succeed");
+        assert_eq!(parsed.auto_fix_prompt, None);
     }
 
     #[cfg(feature = "managed-network-proxy")]
@@ -5264,6 +5300,7 @@ model_verbosity = "high"
             Config {
                 model: Some("o3".to_string()),
                 review_model: None,
+                auto_fix_prompt: None,
                 model_context_window: None,
                 model_auto_compact_token_limit: None,
                 service_tier: None,
@@ -5394,6 +5431,7 @@ model_verbosity = "high"
         let expected_gpt3_profile_config = Config {
             model: Some("gpt-3.5-turbo".to_string()),
             review_model: None,
+            auto_fix_prompt: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             service_tier: None,
@@ -5522,6 +5560,7 @@ model_verbosity = "high"
         let expected_zdr_profile_config = Config {
             model: Some("o3".to_string()),
             review_model: None,
+            auto_fix_prompt: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             service_tier: None,
@@ -5636,6 +5675,7 @@ model_verbosity = "high"
         let expected_gpt5_profile_config = Config {
             model: Some("gpt-5.1".to_string()),
             review_model: None,
+            auto_fix_prompt: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
             service_tier: None,
