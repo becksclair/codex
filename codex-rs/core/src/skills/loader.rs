@@ -2681,7 +2681,12 @@ permissions:
         let cfg = make_config(&codex_home).await;
 
         let scopes: Vec<SkillScope> =
-            super::skill_roots(&cfg.config_layer_stack, &cfg.cwd, Vec::new())
+            super::skill_roots_with_home_dir(
+                &cfg.config_layer_stack,
+                &cfg.cwd,
+                Some(cfg.codex_home.as_path()),
+                Vec::new(),
+            )
                 .into_iter()
                 .map(|root| root.scope)
                 .collect();
